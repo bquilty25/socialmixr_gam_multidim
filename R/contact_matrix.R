@@ -796,3 +796,541 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
 
   return(ret)
 }
+
+#' Generate a contact matrix using GAMs
+#'
+#' Fits a Generalized Additive Model (GAM) to survey data to model contact
+#' patterns based on specified dimensions (e.g., age, gender) using tensor
+#' product splines and interaction terms, then predicts contact rates over a
+#' defined grid.
+#'
+#' @param survey A `contact_survey` object.
+#' @param countries Optional vector of country names or codes to filter data.
+#' @param dimensions A character vector naming the columns in the survey data
+#'   to be used as dimensions in the GAM and the resulting matrix (e.g.,
+#'   `c("part_age", "cnt_age", "part_gender", "cnt_gender")`). Assumes these columns exist
+#'   and come in pairs following the "part_" and "cnt_" naming convention.
+#' @param dim_breaks A named list where each name corresponds to a dimension in
+#'   `dimensions`. For numeric dimensions (like age), the value should be a numeric
+#'   vector defining the breaks for prediction grid bins (e.g., `seq(0, 80, 5)`).
+#'   For factor/character dimensions (like gender), the value should be a vector
+#'   of the levels (e.g., `c("F", "M")`).
+#' @param gam_formula Optional. A `formula` object for the GAM model. If provided,
+#'   it overrides the default automatic formula generation. Use this for custom model
+#'   structures, like including interactions between numeric and categorical
+#'   dimensions (e.g., age-gender interaction using `by=` in smooth terms:
+#'   `s(part_age, by = part_gender)`).
+#'   If `NULL` (default), the formula is built automatically including tensor
+#'   products for numeric pairs (`te(...)`), interactions for categorical pairs
+#'   (`interaction(...)`), and smooths for numeric dimensions varying by
+#'   categorical dimensions (`s(..., by = ...)`).
+#' @param family The error distribution and link function to be used in the
+#'  `mgcv::gam` model (e.g., `nb()` for Negative Binomial, `poisson()`).
+#' @param k_tensor Numeric vector `c(k1, k2)` specifying the basis dimensions `k` for
+#'   the tensor product smooth `te()` between numeric pairs (e.g., age-age).
+#'   Defaults to `c(8, 8)`.
+#' @param k_by Numeric value specifying the basis dimension `k` for smooth terms
+#'   interacting with categorical variables (`s(..., by = ...)`). Defaults to 6.
+#' @param bs_numeric Character string specifying the basis type (e.g., "ps", "cr")
+#'   for all numeric smooth terms (`te` and `s`). Defaults to "ps".
+#' @param filter Optional list to filter survey data before modeling.
+#' @param age_limits Optional vector specifying the minimum and maximum age to consider.
+#'   Participants or contacts outside these limits will be excluded before modeling.
+#' @param ... Additional arguments passed to `mgcv::gam`.
+#'
+#' @return A list containing:
+#'   - `matrix`: The predicted contact matrix (as a multidimensional array).
+#'   - `gam_fit`: The fitted `gam` object from `mgcv`.
+#'   - `prediction_grid`: The data frame used for prediction.
+#'   - `dimensions`: The names of the dimensions.
+#'   - `dim_breaks`: The breaks used for each dimension.
+#'   - `gam_formula`: The `formula` object that was automatically generated (or NA if `gam_formula` was provided).
+#'
+#' @importFrom mgcv gam predict.gam
+#' @importFrom stats formula reshape aggregate family poisson gaussian nb as.formula
+#' @importFrom graphics image
+#' @export
+#' @examples
+#' \dontrun{
+#' library(socialmixr)
+#' library(mgcv)
+#' data(polymod)
+#'
+#' # Define dimensions and breaks for age (5-year bands) and gender
+#' dimensions_demo <- c("part_age", "cnt_age", "part_gender", "cnt_gender")
+#' dim_breaks_demo <- list(
+#'   part_age = seq(0, 75, 5),
+#'   cnt_age = seq(0, 75, 5),
+#'   part_gender = c("F", "M"),
+#'   cnt_gender = c("F", "M")
+#' )
+#'
+#' # Run the GAM-based contact matrix estimation (default: includes age-gender interactions)
+#' gam_matrix_result_auto <- gam_contact_matrix(
+#'   survey = polymod,
+#'   countries = "United Kingdom",
+#'   # gam_formula = NULL, # Let formula be generated automatically
+#'   dimensions = dimensions_demo,
+#'   dim_breaks = dim_breaks_demo,
+#'   family = nb(),
+#'   age_limits = c(0, 75)
+#'   # Optional controls for smooths:
+#'   # k_tensor = c(8, 8), # Tensor smooth complexity
+#'   # k_by = 6,           # Complexity for smooths varying by category
+#'   # bs_numeric = "ps"   # Basis type
+#' )
+#'
+#' # Example of providing a simpler custom formula (e.g., separate age/gender effects)
+#' # gam_formula_simple <- N ~ te(part_age, cnt_age, k=c(10,10), bs="ps") +
+#' #                         s(part_age, k=10, bs="ps") + s(cnt_age, k=10, bs="ps") +
+#' #                         interaction(part_gender, cnt_gender)
+#' # gam_matrix_result_simple <- gam_contact_matrix(
+#' #   survey = polymod, countries = "United Kingdom",
+#' #   gam_formula = gam_formula_simple,
+#' #   dimensions = dimensions_demo, dim_breaks = dim_breaks_demo,
+#' #   family = nb(), age_limits = c(0, 75)
+#' # )
+#'
+#' # Check the automatically generated formula
+#' print(gam_matrix_result_auto$gam_formula)
+#'
+#' # Explore the results (similar to previous example)
+#' print(dim(gam_matrix_result_auto$matrix))
+#' image(
+#'    x = dim_breaks_demo$part_age, y = dim_breaks_demo$cnt_age,
+#'    z = gam_matrix_result_auto$matrix[, , "F", "F"],
+#'    xlab = "Participant Age", ylab = "Contact Age",
+#'    main = "Predicted Contacts: F participants vs F contacts (UK, Polymod - Default Auto Formula)"
+#' )
+#' }
+gam_contact_matrix <- function(survey,
+                               countries = NULL,
+                               dimensions,
+                               dim_breaks,
+                               gam_formula = NULL,
+                               family = nb(),
+                               k_tensor = c(8, 8),
+                               k_by = 6,
+                               bs_numeric = "ps",
+                               filter = NULL,
+                               age_limits = NULL,
+                               ...) {
+
+  # Check if mgcv is installed
+  if (!requireNamespace("mgcv", quietly = TRUE)) {
+    stop("Package 'mgcv' needed for this function to work. Please install it.",
+         call. = FALSE)
+  }
+
+  # --- Argument checks ---
+  if (!inherits(survey, "contact_survey")) {
+    stop("`survey` must be a survey object.")
+  }
+   if (!is.character(dimensions) || length(dimensions) < 2 || length(dimensions) %% 2 != 0) {
+     stop("`dimensions` must be an even-length character vector with at least two dimension names (expected in part_/cnt_ pairs).")
+  }
+  if (!is.list(dim_breaks) || !all(names(dim_breaks) %in% dimensions)) {
+    stop("`dim_breaks` must be a named list with names corresponding to `dimensions`.")
+  }
+   if (!all(dimensions %in% names(dim_breaks))) {
+    stop("Each dimension in `dimensions` must have corresponding breaks in `dim_breaks`.")
+  }
+  # Check pairing
+  part_dims <- dimensions[startsWith(dimensions, "part_")]
+  cnt_dims <- dimensions[startsWith(dimensions, "cnt_")]
+  if (length(part_dims) != length(cnt_dims) || length(part_dims) != length(dimensions) / 2) {
+      stop("`dimensions` must contain an equal number of 'part_' and 'cnt_' prefixed names.")
+  }
+  dim_suffixes <- sub("^part_", "", part_dims)
+  if (!all(sub("^cnt_", "", cnt_dims) == dim_suffixes)) {
+     stop("`dimensions` must form pairs based on suffixes (e.g., 'part_age'/'cnt_age', 'part_gender'/'cnt_gender').")
+  }
+
+
+  # --- 1. Data Preparation ---
+  survey_data <- copy(survey) # Avoid modifying the original object
+
+  # Ensure part_age/cnt_age columns exist
+  # (Adding basic handling for other potential numeric/factor dimensions if needed)
+  for (suffix in dim_suffixes) {
+      part_dim_name <- paste0("part_", suffix)
+      cnt_dim_name <- paste0("cnt_", suffix)
+
+      # Participant dimension
+      if (!(part_dim_name %in% names(survey_data$participants))) {
+          exact_col <- paste0(part_dim_name, "_exact")
+          est_min_col <- paste0(part_dim_name, "_est_min")
+          est_max_col <- paste0(part_dim_name, "_est_max")
+
+          if (exact_col %in% names(survey_data$participants)) {
+              survey_data$participants[, (part_dim_name) := survey_data$participants[[exact_col]]]
+          } else if (est_min_col %in% names(survey_data$participants) && est_max_col %in% names(survey_data$participants)) {
+               survey_data$participants[, (part_dim_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
+               message(paste("Note: Created", part_dim_name, "using mean of", est_min_col, "and", est_max_col))
+          } else {
+              stop(paste("Cannot find or create required participant dimension:", part_dim_name))
+          }
+           # Ensure correct type if age
+           if (suffix == "age") {
+               survey_data$participants[, (part_dim_name) := as.integer(get(part_dim_name))]
+           }
+      }
+
+      # Contact dimension
+      if (!(cnt_dim_name %in% names(survey_data$contacts))) {
+          exact_col <- paste0(cnt_dim_name, "_exact")
+          est_min_col <- paste0(cnt_dim_name, "_est_min")
+          est_max_col <- paste0(cnt_dim_name, "_est_max")
+
+          if (exact_col %in% names(survey_data$contacts)) {
+              survey_data$contacts[, (cnt_dim_name) := survey_data$contacts[[exact_col]]]
+          } else if (est_min_col %in% names(survey_data$contacts) && est_max_col %in% names(survey_data$contacts)) {
+               survey_data$contacts[, (cnt_dim_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
+               message(paste("Note: Created", cnt_dim_name, "using mean of", est_min_col, "and", est_max_col))
+          } else {
+              # If contact dimension is missing, maybe we can infer it? Risky. Stop for now.
+               stop(paste("Cannot find or create required contact dimension:", cnt_dim_name))
+          }
+           # Ensure correct type if age
+           if (suffix == "age") {
+               survey_data$contacts[, (cnt_dim_name) := as.integer(get(cnt_dim_name))]
+           }
+      }
+  }
+
+
+  # Filter by country if specified
+  if (!is.null(countries) && "country" %in% names(survey_data$participants)) {
+      # Use countrycode logic similar to contact_matrix if needed
+      if (all(nchar(countries) == 2)) {
+       corrected_countries <- suppressWarnings(
+         countrycode::countrycode(countries, "iso2c", "country.name")
+       )
+     } else {
+       corrected_countries <- suppressWarnings(
+         countrycode::countrycode(countries, "country.name", "country.name")
+       )
+     }
+      missing_countries <- countries[is.na(corrected_countries)]
+      if (length(missing_countries) > 0) {
+        stop("Survey data not found for ", paste(missing_countries, collapse = ", "), ".")
+      }
+      countries <- corrected_countries
+      survey_data$participants <- survey_data$participants[country %in% countries]
+      if (nrow(survey_data$participants) == 0) {
+        stop("No participants left after selecting countries.")
+      }
+      # Filter contacts based on remaining participants
+      survey_data$contacts <- survey_data$contacts[part_id %in% survey_data$participants$part_id]
+  }
+
+  # Apply filters if provided (simplified version)
+  if (!is.null(filter)) {
+      for (col in names(filter)) {
+        if (col %in% names(survey_data$participants)) {
+          survey_data$participants <- survey_data$participants[get(col) == filter[[col]]]
+        }
+         if (col %in% names(survey_data$contacts)) {
+           survey_data$contacts <- survey_data$contacts[get(col) == filter[[col]]]
+         }
+      }
+      # Ensure consistency after filtering
+      survey_data$participants <- survey_data$participants[part_id %in% survey_data$contacts$part_id]
+      survey_data$contacts <- survey_data$contacts[part_id %in% survey_data$participants$part_id]
+       if (nrow(survey_data$participants) == 0 || nrow(survey_data$contacts) == 0) {
+        stop("No data left after applying filters.")
+      }
+  }
+
+   # Ensure required dimension columns exist (already checked implicitly above)
+   required_participant_cols <- dimensions[grepl("^part_", dimensions)]
+   required_contact_cols <- dimensions[grepl("^cnt_", dimensions)]
+
+   # Handle age limits - must happen *after* age columns are created
+   if (!is.null(age_limits)) {
+       if (!is.numeric(age_limits) || length(age_limits) != 2 || age_limits[1] >= age_limits[2]) {
+           stop("`age_limits` must be a numeric vector of length 2 specifying min and max age.")
+       }
+       min_age <- age_limits[1]
+       max_age <- age_limits[2]
+
+       # Filter participants if part_age exists
+       if ("part_age" %in% names(survey_data$participants)) {
+           survey_data$participants <- survey_data$participants[part_age >= min_age & part_age <= max_age]
+       } else if ("part_age" %in% dimensions) {
+           warning("age_limits provided but 'part_age' column not found after data preparation.")
+       }
+       # Filter contacts if cnt_age exists
+        if ("cnt_age" %in% names(survey_data$contacts)) {
+           survey_data$contacts <- survey_data$contacts[cnt_age >= min_age & cnt_age <= max_age]
+       } else if ("cnt_age" %in% dimensions) {
+            warning("age_limits provided but 'cnt_age' column not found after data preparation.")
+       }
+        # Ensure consistency after filtering
+       part_ids_remain <- unique(survey_data$participants$part_id)
+       survey_data$contacts <- survey_data$contacts[part_id %in% part_ids_remain]
+       contact_ids_remain <- unique(survey_data$contacts$part_id)
+       survey_data$participants <- survey_data$participants[part_id %in% contact_ids_remain]
+
+        if (nrow(survey_data$participants) == 0 || nrow(survey_data$contacts) == 0) {
+           stop("No data left after applying age limits.")
+       }
+   }
+
+
+  # Merge participant dimensions onto contacts data
+  part_dims_to_merge <- intersect(required_participant_cols, names(survey_data$participants))
+  if (length(part_dims_to_merge) > 0) {
+      # Ensure part_id exists for merging
+       if (!"part_id" %in% names(survey_data$participants) || !"part_id" %in% names(survey_data$contacts)) {
+           stop("Missing 'part_id' column, required for merging participant data.")
+       }
+      merge_cols <- unique(c("part_id", part_dims_to_merge)) # Ensure part_id is included and unique
+      gam_data_full <- merge(
+          survey_data$contacts,
+          survey_data$participants[, ..merge_cols], # Use data.table subsetting
+          by = "part_id"
+      )
+  } else {
+      gam_data_full <- survey_data$contacts
+  }
+
+  # Check if all dimensions are now in the merged data
+   missing_dims_in_merged <- setdiff(dimensions, names(gam_data_full))
+   if (length(missing_dims_in_merged) > 0) {
+       stop(paste("Internal error: After merging, the following dimensions are missing:",
+                 paste(missing_dims_in_merged, collapse=", ")))
+   }
+
+   # Convert character dimensions to factors for GAM compatibility if needed
+   for(dim_name in dimensions) {
+       if(is.character(gam_data_full[[dim_name]])) {
+           message(paste("Converting character dimension", dim_name, "to factor."))
+           gam_data_full[, (dim_name) := as.factor(get(dim_name))]
+       }
+   }
+
+
+  # Aggregate contacts: Count N contacts for each combination of participant & contact characteristics
+  grouping_vars <- dimensions
+  gam_data_agg <- gam_data_full[, .N, by = c(grouping_vars)]
+
+
+  # --- 2. Build or Use GAM Formula ---
+  if (is.null(gam_formula)) {
+    # --- Build GAM Formula Automatically (Default: includes interactions) ---
+    message("Building GAM formula automatically (default includes num-cat interactions)...")
+    formula_terms <- c()
+
+    # Check argument validity
+    if(!is.numeric(k_tensor) || length(k_tensor) != 2) stop("`k_tensor` must be a numeric vector of length 2.")
+    if(!is.numeric(k_by) || length(k_by) != 1) stop("`k_by` must be a single numeric value.")
+
+    numeric_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
+    categorical_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) !is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
+
+    for (suffix in dim_suffixes) {
+        part_var <- paste0("part_", suffix)
+        cnt_var <- paste0("cnt_", suffix)
+
+        # Check data type based on aggregated data
+         is_numeric_part <- is.numeric(gam_data_agg[[part_var]])
+         is_numeric_cnt <- is.numeric(gam_data_agg[[cnt_var]])
+
+         if (is_numeric_part != is_numeric_cnt) {
+              stop(paste("Dimension type mismatch for pair:", suffix, "(", part_var, "and", cnt_var, ")"))
+         }
+
+         if (is_numeric_part) { # Numeric pair (e.g., age)
+             # Tensor product interaction
+             formula_terms <- c(formula_terms,
+                               paste0("te(", part_var, ", ", cnt_var,
+                                      ", k = c(", k_tensor[1], ", ", k_tensor[2], "), bs = \"", bs_numeric, "\")"))
+         } else { # Categorical pair (e.g., gender, ethnicity)
+             formula_terms <- c(formula_terms,
+                               paste0("interaction(", part_var, ", ", cnt_var, ")"))
+         }
+    }
+
+    # Add smooths for numeric variables varying by interactions of categorical variables
+    if (length(numeric_suffixes) > 0 && length(categorical_suffixes) > 0) {
+        # Create interaction term string for all categorical pairs
+        # Needs careful construction if > 1 categorical pair
+        if (length(categorical_suffixes) == 1) {
+             sfx <- categorical_suffixes[1]
+             by_var_str <- paste0("interaction(", paste0("part_", sfx), ", ", paste0("cnt_", sfx), ")")
+        } else {
+            # Create nested interactions: interaction(p_g,c_g):interaction(p_e,c_e) etc.
+             individual_interactions <- sapply(categorical_suffixes, function(sfx) {
+                paste0("interaction(", paste0("part_", sfx), ", ", paste0("cnt_", sfx), ")")
+             })
+             by_var_str <- paste(individual_interactions, collapse = ":")
+        }
+
+        for (num_suffix in numeric_suffixes) {
+            part_num_var <- paste0("part_", num_suffix)
+            cnt_num_var <- paste0("cnt_", num_suffix)
+
+            # Add s(..., by = ...) terms
+            formula_terms <- c(formula_terms,
+                              paste0("s(", part_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+            formula_terms <- c(formula_terms,
+                              paste0("s(", cnt_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+        }
+    } else if (length(numeric_suffixes) > 0) {
+         # If only numeric dimensions, add simple smooths (main effects to complement te())
+         for (num_suffix in numeric_suffixes) {
+            part_num_var <- paste0("part_", num_suffix)
+            cnt_num_var <- paste0("cnt_", num_suffix)
+             formula_terms <- c(formula_terms,
+                               paste0("s(", part_num_var, ", k = ", k_tensor[1], ", bs = \"", bs_numeric, "\")"))
+             formula_terms <- c(formula_terms,
+                               paste0("s(", cnt_num_var, ", k = ", k_tensor[2], ", bs = \"", bs_numeric, "\")"))
+         }
+    }
+
+    # Assemble final formula string
+    if (length(formula_terms) == 0) {
+        stop("Could not generate any terms for the GAM formula based on dimensions.")
+    }
+    formula_str <- paste("N ~", paste(formula_terms, collapse = " + "))
+    gam_formula_generated <- as.formula(formula_str)
+    message("Generated GAM formula: ", formula_str)
+    formula_to_use <- gam_formula_generated
+  } else {
+    # --- Use Provided GAM Formula ---
+     if (!inherits(gam_formula, "formula")) {
+        stop("`gam_formula` must be a formula object or NULL.")
+     }
+     message("Using provided GAM formula.")
+     formula_to_use <- gam_formula
+     # Set generated formula to NA if formula provided by user
+     gam_formula_generated <- NA
+  }
+
+
+  # --- 3. Fit GAM ---
+  message("Fitting GAM model...")
+  gam_fit <- mgcv::gam(
+      formula = formula_to_use, # Use the generated or provided formula
+      data = gam_data_agg,
+      family = family,
+      method = "REML", # Default method, often robust
+      ...             # Pass additional args to gam
+  )
+  message("GAM fitting complete.")
+
+  # --- 4. Create Prediction Grid ---
+  prediction_grid_list <- lapply(dimensions, function(dim_name) {
+    breaks <- dim_breaks[[dim_name]]
+    if (is.numeric(breaks)) {
+      # Create midpoints from breaks for prediction
+      if(length(breaks) < 2) stop(paste("Numeric dimension", dim_name, "needs at least 2 breaks."))
+      return(breaks[-length(breaks)] + diff(breaks) / 2)
+    } else {
+      # Use levels directly for factors/characters
+       # Ensure levels used for prediction match factor levels in fitted data
+       if (is.factor(gam_data_agg[[dim_name]])) {
+           data_levels <- levels(gam_data_agg[[dim_name]])
+            provided_levels <- as.character(breaks)
+            if (!all(provided_levels %in% data_levels)) {
+                 warning(paste("Some levels provided in dim_breaks for", dim_name,
+                              "are not present in the modeling data factors:",
+                               paste(setdiff(provided_levels, data_levels), collapse=", ")))
+            }
+             # Return factor with levels matching data, subsetted by provided breaks
+             return(factor(provided_levels, levels=data_levels))
+
+       } else {
+            return(breaks) # Assume character otherwise
+       }
+    }
+  })
+  names(prediction_grid_list) <- dimensions
+
+  # Ensure factor levels in prediction grid match those used in model fitting
+  prediction_grid <- do.call(expand.grid, c(prediction_grid_list, list(KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)))
+
+
+  # --- 5. Predict using GAM ---
+  message("Predicting contact rates on grid...")
+  # Need to handle potential missing factor levels between model data and prediction grid
+  predicted_values <- tryCatch({
+        mgcv::predict.gam(
+           gam_fit,
+           newdata = prediction_grid,
+           type = "response", # Get predictions on the scale of the response
+           se.fit = FALSE
+       )
+    }, error = function(e) {
+        # Common error is factor level mismatch
+        if (grepl("factor .* has new levels", e$message)) {
+            stop(paste("Error during prediction: Factor level mismatch.",
+                       "Ensure levels in `dim_breaks` for categorical dimensions",
+                       "exactly match the levels present in the data used for fitting.",
+                       "Original error:", e$message), call. = FALSE)
+        } else {
+            stop(paste("Error during prediction:", e$message), call. = FALSE)
+        }
+  })
+   message("Prediction complete.")
+
+  # --- 6. Reshape into Matrix/Array ---
+  # Determine the dimensions of the output array based on the number of levels/bins
+   # For factors, use the length of the provided breaks/levels
+   array_dims <- sapply(names(prediction_grid_list), function(dim_name) {
+       breaks <- dim_breaks[[dim_name]]
+       if (is.numeric(breaks)) {
+           return(length(breaks) - 1) # Number of intervals
+       } else {
+           return(length(breaks)) # Number of levels
+       }
+   })
+  names(array_dims) <- dimensions # Keep dimension names
+
+  # Create dimnames for the array
+  array_dimnames <- lapply(dimensions, function(dim_name) {
+      breaks <- dim_breaks[[dim_name]]
+      if (is.numeric(breaks)) {
+          # Use interval notation like contact_matrix
+           lower <- breaks[-length(breaks)]
+           upper <- breaks[-1]
+           # Format nicely
+           format_interval <- function(l, u) {
+               paste0("[", format(l, trim=TRUE), ",", format(u, trim=TRUE), ")")
+           }
+           return(format_interval(lower, upper))
+      } else {
+          # Use factor levels directly
+           return(as.character(breaks))
+      }
+  })
+  names(array_dimnames) <- dimensions
+
+  # Reshape the predicted values into the array
+  # Ensure the order of prediction matches the order of the reshaped array
+  # expand.grid generates data varying the first variable fastest.
+  # The array() function fills by varying the first index fastest. So the order should match.
+  contact_array <- array(
+      data = predicted_values,
+      dim = array_dims,
+      dimnames = array_dimnames
+  )
+
+  # --- 7. Return Results ---
+  return(
+    list(
+      matrix = contact_array,
+      gam_fit = gam_fit,
+      prediction_grid = prediction_grid,
+      dimensions = dimensions,
+      dim_breaks = dim_breaks,
+      gam_formula = gam_formula_generated # Return the generated formula (NA if provided)
+    )
+  )
+}
+
+# Helper function (if not already present) - reduce_agegroups
+# Ensure this exists or is defined if needed by other parts of contact_matrix.R
+# reduce_agegroups <- function(ages, limits) { ... }
+
