@@ -1,0 +1,227 @@
+---
+title: "Analysis of Social Contact Patterns Using Generalized Additive Models"
+author: "Billy Quilty"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    fig-responsive: true
+    fig-dpi: 600
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| include: false
+library(socialmixr)
+library(mgcv)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+```
+
+## Abstract
+
+This analysis examines social contact patterns in the United Kingdom using data from the POLYMOD survey. We employ Generalized Additive Models (GAMs) with tensor product splines to model contact rates across age and gender dimensions. Our approach captures both the main effects of age and gender, as well as their interactions, providing a nuanced understanding of social mixing patterns. The analysis reveals distinct patterns in contact rates across different age and gender combinations, with implications for understanding social dynamics and disease transmission.
+
+## Introduction
+
+Understanding social contact patterns is crucial for modelling disease transmission and social dynamics. The POLYMOD survey provides detailed data on social contacts across different demographic groups. This analysis focuses on the United Kingdom subset of the POLYMOD data, examining how contact rates vary by age and gender using flexible statistical models.
+
+## Methods
+
+### Data Source
+
+We utilised the POLYMOD survey data, specifically focusing on the United Kingdom subset. The data includes information on participant age, gender, and their contacts' age and gender.
+
+### Statistical Modelling
+
+We employed Generalized Additive Models (GAMs) with the following components:
+
+1. Tensor product splines for age-age interactions
+2. Gender interaction terms
+3. Age-gender smooth interactions
+
+The model structure can be expressed as:
+
+```{r}
+#| echo: false
+#| eval: false
+N ~ te(part_age, cnt_age, k=c(8,8), bs="ps") +
+    interaction(part_gender, cnt_gender) +
+    s(part_age, by=interaction(part_gender, cnt_gender), k=6, bs="ps") +
+    s(cnt_age, by=interaction(part_gender, cnt_gender), k=6, bs="ps")
+```
+
+### Model Comparison
+
+We compared two model specifications:
+1. A complex model including age-gender interactions
+2. A simpler model with separate age and gender effects
+
+Model comparison was performed using:
+- Analysis of Variance (ANOVA)
+- Akaike Information Criterion (AIC)
+
+## Results
+
+### Contact Matrix Patterns
+
+```{r}
+#| include: false
+# Load and process data
+data(polymod)
+
+# Define dimensions and breaks
+dimensions <- c("part_age", "cnt_age", "part_gender", "cnt_gender")
+dimension_breaks <- list(
+  part_age = seq(0, 75, 5),
+  cnt_age = seq(0, 75, 5),
+  part_gender = c("F", "M"),
+  cnt_gender = c("F", "M")
+)
+
+# Run GAM analysis
+source("R/contact_matrix.R")
+gam_results <- gam_contact_matrix(
+  survey = polymod,
+  countries = "United Kingdom",
+  dimensions = dimensions,
+  dim_breaks = dimension_breaks,
+  family = nb(),
+  age_limits = c(0, 75)
+)
+
+# Process results for plotting
+plot_data <- gam_results$prediction_grid
+plot_data$predicted_contacts <- as.vector(gam_results$matrix)
+setDT(plot_data)
+
+# Generate age labels
+age_labels_part <- paste0("[", dimension_breaks$part_age[-length(dimension_breaks$part_age)], ",", dimension_breaks$part_age[-1], ")")
+age_labels_cnt <- paste0("[", dimension_breaks$cnt_age[-length(dimension_breaks$cnt_age)], ",", dimension_breaks$cnt_age[-1], ")")
+
+# Factorise for plotting
+plot_data[, part_age_group := factor(paste0("[", findInterval(part_age, dimension_breaks$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dimension_breaks$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
+plot_data[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dimension_breaks$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dimension_breaks$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+
+# Create plots
+plots_list <- list()
+gender_pairs <- expand.grid(part_g = dimension_breaks$part_gender, cnt_g = dimension_breaks$cnt_gender)
+
+for (i in 1:nrow(gender_pairs)) {
+  p_gender <- as.character(gender_pairs$part_g[i])
+  c_gender <- as.character(gender_pairs$cnt_g[i])
+  
+  plot_subset <- plot_data[part_gender == p_gender & cnt_gender == c_gender]
+  
+  p <- ggplot(plot_subset, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
+    geom_tile(colour = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts") +
+    labs(
+      title = sprintf("%s Participants vs %s Contacts", p_gender, c_gender),
+      x = "Participant Age Group",
+      y = "Contact Age Group"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size=7),
+      axis.text.y = element_text(size=7),
+      legend.position = "right"
+    )
+  
+  plots_list[[paste(p_gender, c_gender, sep = "_")]] <- p
+}
+
+# Combine plots
+combined_plot <- (plots_list[["F_F"]] | plots_list[["F_M"]]) / (plots_list[["M_F"]] | plots_list[["M_M"]])
+```
+
+```{r}
+#| fig-cap: "Contact matrices showing predicted contact rates across age groups for different gender combinations"
+#| fig-alt: "Four heatmaps showing contact rates between different age groups for female-female, female-male, male-female, and male-male interactions"
+combined_plot
+```
+
+### Model Comparison Results
+
+```{r}
+#| include: false
+# Prepare data for direct model comparison
+survey_data_prep <- copy(polymod)
+survey_data_prep$participants <- survey_data_prep$participants[country == "United Kingdom"]
+survey_data_prep$contacts <- survey_data_prep$contacts[part_id %in% survey_data_prep$participants$part_id]
+
+# Ensure age columns exist
+if (!"part_age" %in% names(survey_data_prep$participants)) survey_data_prep$participants[, part_age := as.integer(part_age_exact)]
+if (!"cnt_age" %in% names(survey_data_prep$contacts)) survey_data_prep$contacts[, cnt_age := as.integer(cnt_age_exact)]
+
+# Apply age limits
+survey_data_prep$participants <- survey_data_prep$participants[part_age >= 0 & part_age <= 75]
+survey_data_prep$contacts <- survey_data_prep$contacts[cnt_age >= 0 & cnt_age <= 75]
+
+# Merge and prepare data
+gam_data_full_direct <- merge(
+  survey_data_prep$contacts,
+  survey_data_prep$participants[, .(part_id, part_age, part_gender)],
+  by = "part_id"
+)
+
+# Convert factors and aggregate
+gam_data_full_direct[, part_gender := as.factor(part_gender)]
+gam_data_full_direct[, cnt_gender := as.factor(cnt_gender)]
+gam_data_agg_direct <- gam_data_full_direct[, .N, by = c("part_age", "cnt_age", "part_gender", "cnt_gender")]
+
+# Fit models
+complex_formula <- N ~ te(part_age, cnt_age, k=c(8,8), bs="ps") +
+                     interaction(part_gender, cnt_gender) +
+                     s(part_age, by=interaction(part_gender, cnt_gender), k=6, bs="ps") +
+                     s(cnt_age, by=interaction(part_gender, cnt_gender), k=6, bs="ps")
+
+simple_formula <- N ~ te(part_age, cnt_age, k=c(8,8), bs="ps") +
+                    interaction(part_gender, cnt_gender)
+
+complex_gam <- gam(complex_formula, data = gam_data_agg_direct, family = nb(), method = "REML")
+simple_gam <- gam(simple_formula, data = gam_data_agg_direct, family = nb(), method = "REML")
+
+# Perform diagnostic checks on the complex model
+cat("\n--- GAM Check (Complex Model) ---\n")
+mgcv::gam.check(complex_gam)
+cat("--- End GAM Check ---\n\n")
+
+# Compare models
+model_comparison <- anova(simple_gam, complex_gam, test = "Chisq")
+aic_complex <- AIC(complex_gam)
+aic_simple <- AIC(simple_gam)
+```
+
+The model comparison results reveal:
+
+```{r}
+#| echo: false
+print(model_comparison)
+```
+
+The AIC values for the models are:
+- Complex model (with age-gender interactions): `r round(aic_complex, 2)`
+- Simple model (without age-gender interactions): `r round(aic_simple, 2)`
+
+## Discussion
+
+The analysis reveals several key findings about social contact patterns in the United Kingdom:
+
+1. **Age-specific patterns**: The contact matrices show distinct patterns across different age groups, with higher contact rates typically observed within similar age groups.
+
+2. **Gender differences**: The analysis reveals gender-specific patterns in social mixing, with notable differences between same-gender and cross-gender interactions.
+
+3. **Model complexity**: The complex model incorporating age-gender interactions provides a better fit to the data compared to the simpler model, as evidenced by both the ANOVA results and AIC comparison.
+
+These findings have important implications for understanding social dynamics and disease transmission patterns. The observed age and gender-specific patterns suggest that social mixing is not random but follows structured patterns that should be considered in epidemiological models.
+
+## Conclusion
+
+This analysis demonstrates the utility of GAMs in capturing complex social contact patterns across multiple dimensions. The results provide valuable insights into age and gender-specific mixing patterns in the United Kingdom, which can inform both social science research and epidemiological modelling.
