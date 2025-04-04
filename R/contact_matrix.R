@@ -794,7 +794,19 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
     ret[["participants.weights"]] <- part.weights[]
   }
 
-  return(ret)
+  # --- 7. Return Results ---
+  # Assign gam_fit to a temp variable to avoid potential naming conflicts
+  final_gam_fit <- gam_fit
+
+  return(
+    list(
+      matrix = weighted.matrix,
+      gam_fit = final_gam_fit, # Use the temp variable
+      prediction_grid = prediction_grid,
+      dimensions = dimensions,
+      dim_breaks = dim_breaks
+    )
+  )
 }
 
 #' Generate a contact matrix using GAMs
@@ -836,15 +848,25 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
 #' @param filter Optional list to filter survey data before modeling.
 #' @param age_limits Optional vector specifying the minimum and maximum age to consider.
 #'   Participants or contacts outside these limits will be excluded before modeling.
+#' @param weigh.dayofweek Logical; if TRUE, weigh contacts by day of the week.
+#' @param weigh.age Logical; if TRUE, weigh contacts by participant age distribution
+#'   compared to the population distribution provided in `survey.pop`. Requires
+#'   `part_age` in `dimensions`.
+#' @param survey.pop Population data, required if `weigh.age = TRUE`. Can be a
+#'   data frame with `lower.age.limit` and `population` columns, or country name(s).
+#' @param user_weights Character vector of column names in `survey$participants`
+#'   containing custom weights to apply.
+#' @param weight.threshold Numeric threshold to truncate calculated weights before
+#'   standardization. Defaults to `NA` (no truncation).
 #' @param ... Additional arguments passed to `mgcv::gam`.
 #'
 #' @return A list containing:
-#'   - `matrix`: The predicted contact matrix (as a multidimensional array).
+#'   - `matrix`: The predicted contact matrix (as a multidimensional array, representing predicted sum of weights).
 #'   - `gam_fit`: The fitted `gam` object from `mgcv`.
 #'   - `prediction_grid`: The data frame used for prediction.
 #'   - `dimensions`: The names of the dimensions.
 #'   - `dim_breaks`: The breaks used for each dimension.
-#'   - `gam_formula`: The `formula` object that was automatically generated (or NA if `gam_formula` was provided).
+#'   - `gam_formula_str`: The formula string used for the GAM fit.
 #'
 #' @importFrom mgcv gam predict.gam
 #' @importFrom stats formula reshape aggregate family poisson gaussian nb as.formula
@@ -892,7 +914,7 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
 #' # )
 #'
 #' # Check the automatically generated formula
-#' print(gam_matrix_result_auto$gam_formula)
+#' print(gam_matrix_result_auto$gam_formula_str)
 #'
 #' # Explore the results (similar to previous example)
 #' print(dim(gam_matrix_result_auto$matrix))
@@ -914,6 +936,11 @@ gam_contact_matrix <- function(survey,
                                bs_numeric = "ps",
                                filter = NULL,
                                age_limits = NULL,
+                               weigh.dayofweek = FALSE,
+                               weigh.age = FALSE,
+                               survey.pop = NULL,
+                               user_weights = NULL,
+                               weight.threshold = NA,
                                ...) {
 
   # Check if mgcv is installed
@@ -946,55 +973,76 @@ gam_contact_matrix <- function(survey,
      stop("`dimensions` must form pairs based on suffixes (e.g., 'part_age'/'cnt_age', 'part_gender'/'cnt_gender').")
   }
 
+  # --- Additional Argument Checks for Weighting ---
+  if (weigh.age) {
+      if (is.null(survey.pop)) {
+          stop("`survey.pop` must be provided when `weigh.age = TRUE`.")
+      }
+      if (!"part_age" %in% dimensions) {
+          stop("`part_age` must be included in `dimensions` when `weigh.age = TRUE`.")
+      }
+      # Check if pop_age function is available if needed
+      if (is.character(survey.pop) && !exists("wpp_age")) {
+            warning("`survey.pop` provided as country names, but `wpp_age` function (e.g., from wppExplorer) not found. Age weighting by country name might fail.")
+      }
+       if (is.data.frame(survey.pop) && !exists("pop_age")) {
+            warning("`pop_age` function (from socialmixr) not found. Age weighting interpolation might fail.")
+       }
+  }
+  if (!is.null(user_weights) && !is.character(user_weights)) {
+      stop("`user_weights` must be a character vector of column names or NULL.")
+  }
+
 
   # --- 1. Data Preparation ---
   survey_data <- copy(survey) # Avoid modifying the original object
 
-  # Ensure part_age/cnt_age columns exist
-  # (Adding basic handling for other potential numeric/factor dimensions if needed)
+  # Ensure essential columns exist (part_id, etc.)
+  if (!"part_id" %in% names(survey_data$participants) || !"part_id" %in% names(survey_data$contacts)) {
+      stop("Both participants and contacts tables must contain 'part_id'.")
+  }
+
+  # Ensure required dimension columns exist and handle estimation (e.g., age from exact/range)
   for (suffix in dim_suffixes) {
       part_dim_name <- paste0("part_", suffix)
       cnt_dim_name <- paste0("cnt_", suffix)
 
-      # Participant dimension
+      # Participant dimension handling (prioritise exact, then mean of range)
       if (!(part_dim_name %in% names(survey_data$participants))) {
           exact_col <- paste0(part_dim_name, "_exact")
           est_min_col <- paste0(part_dim_name, "_est_min")
           est_max_col <- paste0(part_dim_name, "_est_max")
 
           if (exact_col %in% names(survey_data$participants)) {
-              survey_data$participants[, (part_dim_name) := survey_data$participants[[exact_col]]]
+              survey_data$participants[, (part_dim_name) := get(exact_col)]
+              message(paste("Using", exact_col, "for", part_dim_name))
           } else if (est_min_col %in% names(survey_data$participants) && est_max_col %in% names(survey_data$participants)) {
-               survey_data$participants[, (part_dim_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
+               survey_data$participants[, (part_dim_name) := rowMeans(.SD, na.rm = TRUE), .SDcols = c(est_min_col, est_max_col)]
                message(paste("Note: Created", part_dim_name, "using mean of", est_min_col, "and", est_max_col))
           } else {
               stop(paste("Cannot find or create required participant dimension:", part_dim_name))
           }
-           # Ensure correct type if age
-           if (suffix == "age") {
-               survey_data$participants[, (part_dim_name) := as.integer(get(part_dim_name))]
-           }
+           # Ensure correct type
+           if (part_dim_name == "part_age") { survey_data$participants[, (part_dim_name) := as.integer(get(part_dim_name))] }
       }
 
-      # Contact dimension
+      # Contact dimension handling (similar logic)
       if (!(cnt_dim_name %in% names(survey_data$contacts))) {
           exact_col <- paste0(cnt_dim_name, "_exact")
           est_min_col <- paste0(cnt_dim_name, "_est_min")
           est_max_col <- paste0(cnt_dim_name, "_est_max")
 
           if (exact_col %in% names(survey_data$contacts)) {
-              survey_data$contacts[, (cnt_dim_name) := survey_data$contacts[[exact_col]]]
+              survey_data$contacts[, (cnt_dim_name) := get(exact_col)]
+               message(paste("Using", exact_col, "for", cnt_dim_name))
           } else if (est_min_col %in% names(survey_data$contacts) && est_max_col %in% names(survey_data$contacts)) {
-               survey_data$contacts[, (cnt_dim_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
+               survey_data$contacts[, (cnt_dim_name) := rowMeans(.SD, na.rm = TRUE), .SDcols = c(est_min_col, est_max_col)]
                message(paste("Note: Created", cnt_dim_name, "using mean of", est_min_col, "and", est_max_col))
           } else {
-              # If contact dimension is missing, maybe we can infer it? Risky. Stop for now.
                stop(paste("Cannot find or create required contact dimension:", cnt_dim_name))
           }
-           # Ensure correct type if age
-           if (suffix == "age") {
-               survey_data$contacts[, (cnt_dim_name) := as.integer(get(cnt_dim_name))]
-           }
+          # Ensure correct type
+          if (cnt_dim_name == "cnt_age") { survey_data$contacts[, (cnt_dim_name) := as.integer(get(cnt_dim_name))] }
       }
   }
 
@@ -1016,43 +1064,59 @@ gam_contact_matrix <- function(survey,
         stop("Survey data not found for ", paste(missing_countries, collapse = ", "), ".")
       }
       countries <- corrected_countries
+      initial_participants <- nrow(survey_data$participants)
       survey_data$participants <- survey_data$participants[country %in% countries]
       if (nrow(survey_data$participants) == 0) {
         stop("No participants left after selecting countries.")
       }
+      message(paste("Filtered participants by country, keeping", nrow(survey_data$participants), "of", initial_participants))
       # Filter contacts based on remaining participants
+      initial_contacts <- nrow(survey_data$contacts)
       survey_data$contacts <- survey_data$contacts[part_id %in% survey_data$participants$part_id]
+       message(paste("Filtered contacts by remaining participants, keeping", nrow(survey_data$contacts), "of", initial_contacts))
   }
 
   # Apply filters if provided (simplified version)
   if (!is.null(filter)) {
+      original_rows_p <- nrow(survey_data$participants)
+      original_rows_c <- nrow(survey_data$contacts)
       for (col in names(filter)) {
+         filter_val <- filter[[col]]
         if (col %in% names(survey_data$participants)) {
-          survey_data$participants <- survey_data$participants[get(col) == filter[[col]]]
+          survey_data$participants <- survey_data$participants[get(col) == filter_val]
         }
          if (col %in% names(survey_data$contacts)) {
-           survey_data$contacts <- survey_data$contacts[get(col) == filter[[col]]]
+           survey_data$contacts <- survey_data$contacts[get(col) == filter_val]
          }
       }
       # Ensure consistency after filtering
-      survey_data$participants <- survey_data$participants[part_id %in% survey_data$contacts$part_id]
-      survey_data$contacts <- survey_data$contacts[part_id %in% survey_data$participants$part_id]
+      valid_part_ids <- unique(survey_data$participants$part_id)
+      survey_data$contacts <- survey_data$contacts[part_id %in% valid_part_ids]
+      valid_part_ids_after_contact_filter <- unique(survey_data$contacts$part_id)
+      survey_data$participants <- survey_data$participants[part_id %in% valid_part_ids_after_contact_filter]
+
        if (nrow(survey_data$participants) == 0 || nrow(survey_data$contacts) == 0) {
         stop("No data left after applying filters.")
       }
+       message(paste("Applied filters. Participants:", nrow(survey_data$participants), "of", original_rows_p,
+                    " Contacts:", nrow(survey_data$contacts), "of", original_rows_c))
   }
 
    # Ensure required dimension columns exist (already checked implicitly above)
    required_participant_cols <- dimensions[grepl("^part_", dimensions)]
    required_contact_cols <- dimensions[grepl("^cnt_", dimensions)]
 
-   # Handle age limits - must happen *after* age columns are created
+   # Handle age limits - must happen *after* age columns are created/verified
    if (!is.null(age_limits)) {
        if (!is.numeric(age_limits) || length(age_limits) != 2 || age_limits[1] >= age_limits[2]) {
            stop("`age_limits` must be a numeric vector of length 2 specifying min and max age.")
        }
        min_age <- age_limits[1]
        max_age <- age_limits[2]
+       message(paste("Applying age limits:", min_age, "-", max_age))
+
+       original_rows_p <- nrow(survey_data$participants)
+       original_rows_c <- nrow(survey_data$contacts)
 
        # Filter participants if part_age exists
        if ("part_age" %in% names(survey_data$participants)) {
@@ -1078,48 +1142,362 @@ gam_contact_matrix <- function(survey,
    }
 
 
-  # Merge participant dimensions onto contacts data
-  part_dims_to_merge <- intersect(required_participant_cols, names(survey_data$participants))
-  if (length(part_dims_to_merge) > 0) {
-      # Ensure part_id exists for merging
-       if (!"part_id" %in% names(survey_data$participants) || !"part_id" %in% names(survey_data$contacts)) {
-           stop("Missing 'part_id' column, required for merging participant data.")
-       }
-      merge_cols <- unique(c("part_id", part_dims_to_merge)) # Ensure part_id is included and unique
-      gam_data_full <- merge(
-          survey_data$contacts,
-          survey_data$participants[, ..merge_cols], # Use data.table subsetting
-          by = "part_id"
-      )
-  } else {
-      gam_data_full <- survey_data$contacts
+  # --- 1b. Weight Calculation Setup (if needed) ---
+  need.survey.pop.for.weighting <- weigh.age
+  survey.pop.processed <- NULL # Initialize: Pop data aggregated to participant age groups
+  survey.pop.full <- NULL # Initialize: Pop data in detail (e.g., single year)
+  part.age.group.breaks <- NULL # Initialize: Breaks used for participant age grouping
+  part.age.group.present <- NULL # Initialize: Lower limits of participant age groups
+  age.groups <- NULL # Initialize: Factor labels for participant age groups
+  survey.year <- NA_integer_ # Initialize
+
+  # Process population data ONLY if weigh.age is TRUE
+  if (need.survey.pop.for.weighting) {
+     message("Processing survey population data for age weighting...")
+      # Determine age breaks for population processing based on dim_breaks[['part_age']]
+      if (!"part_age" %in% names(dim_breaks) || !is.numeric(dim_breaks[['part_age']])) {
+          stop("`dim_breaks` must contain numeric breaks for 'part_age' when `weigh.age = TRUE`.")
+      }
+      age.limits.for.pop <- dim_breaks[['part_age']]
+      if (anyNA(age.limits.for.pop) || any(diff(age.limits.for.pop) <= 0)) {
+         stop("'dim_breaks' for 'part_age' must be an increasing numeric vector.")
+      }
+
+      # Determine max age needed based on participant data AND breaks
+      max_part_age_data <- -Inf
+      if ("part_age" %in% names(survey_data$participants)) {
+         max_part_age_data <- max(survey_data$participants$part_age, na.rm=TRUE)
+      }
+      max_age_pop <- max(max_part_age_data, max(age.limits.for.pop), na.rm = TRUE) + 1
+
+      # Define age group breaks and levels based on dim_breaks[['part_age']]
+      # These breaks are used *both* for grouping participants and processing pop data
+      part.age.group.present <- age.limits.for.pop[age.limits.for.pop < max_age_pop]
+      part.age.group.breaks <- c(part.age.group.present, max_age_pop)
+      # Generate age group labels using interval notation
+      lower <- part.age.group.present
+      upper <- part.age.group.breaks[-1]
+      age.groups <- paste0("[", format(lower, trim=TRUE), ",", format(upper, trim=TRUE), ")")
+
+      # Process survey.pop (logic adapted from contact_matrix)
+      if (is.character(survey.pop)) {
+           if (!exists("wpp_age")) stop("Function 'wpp_age' (e.g. from wppExplorer) needed for population lookup by country name.")
+           if (!requireNamespace("countrycode", quietly = TRUE)) stop("Package 'countrycode' needed for country name matching.")
+
+           survey.countries <- survey.pop
+           # Use countrycode for robust name matching
+           corrected_countries <- suppressWarnings(countrycode::countrycode(survey.countries, "country.name", "country.name"))
+           if(any(is.na(corrected_countries))) stop("Could not resolve country names: ", paste(survey.countries[is.na(corrected_countries)], collapse=", "))
+
+           country.pop <- data.table(wpp_age(corrected_countries)) # Assumes wpp_age returns required columns
+           country.pop$country <- suppressWarnings(countrycode::countrycode(country.pop$country, "country.name", "country.name")) # Standardize returned names
+
+           # Determine survey year
+           if ("year" %in% colnames(survey_data$participants)) {
+             survey.year <- floor(median(survey_data$participants$year, na.rm = TRUE))
+           } else if ("year" %in% colnames(country.pop)) {
+             survey.year <- max(country.pop$year, na.rm = TRUE)
+             warning("No 'year' column in participant data. Using latest year from population data: ", survey.year)
+           } else {
+             stop("Cannot determine year for population data.")
+           }
+
+           # Get demographic data closest to survey year
+            if ("year" %in% colnames(country.pop)) {
+                country.pop.year <- unique(country.pop$year)
+                survey.year <- min(country.pop.year[which.min(abs(survey.year - country.pop.year))])
+                message("Using population data for year: ", survey.year)
+                survey.pop.base <- country.pop[year == survey.year & country %in% corrected_countries][, list(population = sum(population)), by = "lower.age.limit"] # Make sure lower.age.limit exists
+            } else {
+                 survey.pop.base <- country.pop[country %in% corrected_countries][, list(population = sum(population)), by = "lower.age.limit"]
+            }
+
+
+      } else if (is.data.frame(survey.pop) && all(c("lower.age.limit", "population") %in% names(survey.pop))) {
+          survey.pop.base <- data.table(survey.pop)
+      } else {
+          stop("`survey.pop` must be country names or a data.frame with 'lower.age.limit' and 'population'.")
+      }
+
+       # Prepare survey.pop.base for pop_age
+       survey.pop.base <- survey.pop.base[order(lower.age.limit)]
+       survey.pop.base <- survey.pop.base[!is.na(population)]
+       survey.pop.base[, upper.age.limit := c(survey.pop.base[-.N, lower.age.limit], Inf)] # Use Inf for last group temporarily
+
+       # Check if pop_age function is available
+       if (!exists("pop_age")) stop("Function `pop_age` (from socialmixr) needed for age weighting interpolation.")
+
+       # Use pop_age for interpolation/aggregation
+       # Get detailed (single-year) population for weighting calculation
+       target_ages_detail <- seq(min(0, survey.pop.base$lower.age.limit), max(max_age_pop, survey.pop.base$lower.age.limit)-1)
+       survey.pop.full <- data.table(pop_age(survey.pop.base, target_ages_detail))
+       setnames(survey.pop.full, "lower.age.limit", "part_age", skip_absent=TRUE) # Rename for merging later
+        if (!"population" %in% names(survey.pop.full)) setnames(survey.pop.full, "pop", "population") # Check for alternative name from pop_age
+
+       # Aggregate to the participant age groups for standardization checks later
+       survey.pop.processed <- data.table(pop_age(survey.pop.base, part.age.group.present))
+       survey.pop.processed[, upper.age.limit := c(part.age.group.present[-1], max_age_pop)] # Match breaks used for participants
+       message("Survey population processing complete.")
   }
 
+  # Assign age group to participants *using the breaks derived for weighting/output*
+  if ("part_age" %in% names(survey_data$participants)) {
+     if (is.null(part.age.group.breaks)) { # Define breaks if not done for weighting
+         if (!"part_age" %in% names(dim_breaks) || !is.numeric(dim_breaks[['part_age']])) {
+            stop("Numeric breaks for 'part_age' must be provided in `dim_breaks`.")
+         }
+         age.limits.for.groups <- dim_breaks[['part_age']]
+         max_age_groups <- max(survey_data$participants$part_age, na.rm = TRUE) + 1
+         part.age.group.present_local <- age.limits.for.groups[age.limits.for.groups < max_age_groups]
+         part.age.group.breaks <- c(part.age.group.present_local, max_age_groups)
+          # Generate labels
+         lower <- part.age.group.present_local
+         upper <- part.age.group.breaks[-1]
+         age.groups <- paste0("[", format(lower, trim=TRUE), ",", format(upper, trim=TRUE), ")")
+     }
+
+     survey_data$participants[, age.group := cut(part_age, breaks = part.age.group.breaks, labels = age.groups, right = FALSE, include.lowest = TRUE)]
+  } else if (weigh.age || (!is.null(weight.threshold) && !is.na(weight.threshold))) {
+       # If weighting by age group or thresholding, we need age groups based on part_age
+       stop("'part_age' must be in dimensions and participant data for age weighting or thresholding.")
+  }
+
+
+ # --- 1c. Calculate Participant Weights ---
+ message("Calculating participant weights...")
+ survey_data$participants[, calculated_weight := 1.0] # Use float
+
+ # Day of week weighting
+ if (weigh.dayofweek) {
+     if ("dayofweek" %in% names(survey_data$participants)) {
+         # Ensure dayofweek is numeric/integer
+         if (!is.numeric(survey_data$participants$dayofweek)) {
+             warning("'dayofweek' column is not numeric, cannot perform day-of-week weighting.")
+         } else {
+             survey_data$participants[, is_weekday := dayofweek %in% 1:5]
+             # Calculate weights within groups (weekday/weekend)
+             # Ensure calculation is robust to groups with zero participants
+             survey_data$participants[, temp_N_weekday := sum(is_weekday), by=.(is_weekday)]
+             survey_data$participants[is_weekday == TRUE & temp_N_weekday > 0, weight_factor_dow := 5 / temp_N_weekday]
+             survey_data$participants[is_weekday == FALSE & temp_N_weekday > 0, weight_factor_dow := 2 / temp_N_weekday]
+             # Handle cases where a group might be empty (avoid NaN/Inf)
+              survey_data$participants[is.na(weight_factor_dow), weight_factor_dow := 0]
+             # Apply weight
+             survey_data$participants[, calculated_weight := calculated_weight * weight_factor_dow]
+             # Clean up temporary columns
+             survey_data$participants[, c("is_weekday", "temp_N_weekday", "weight_factor_dow") := NULL]
+             message("Applied day-of-week weighting.")
+         }
+     } else {
+         warning("'weigh.dayofweek' is TRUE, but 'dayofweek' column not found in participant data. Ignoring.")
+     }
+ }
+
+ # Age weighting
+ if (weigh.age) {
+     if (!is.null(survey.pop.full) && "part_age" %in% names(survey_data$participants)) {
+         # Participant distribution by single year of age
+         part_dist <- survey_data$participants[, .N, by = part_age][!is.na(part_age)]
+         if(nrow(part_dist) == 0) {
+              warning("No valid participant ages found for age weighting.")
+         } else {
+             part_dist[, prop_survey := N / sum(N)]
+
+             # Population distribution by single year of age
+             pop_dist <- copy(survey.pop.full) # Use the detailed pop data
+              # Ensure column names match for merge ('part_age', 'population')
+             if (!"part_age" %in% names(pop_dist)) setnames(pop_dist, "lower.age.limit", "part_age", skip_absent = TRUE)
+             if (!"population" %in% names(pop_dist)) setnames(pop_dist, "pop", "population", skip_absent = TRUE)
+             if (!all(c("part_age", "population") %in% names(pop_dist))) {
+                 stop("Processed population data (`survey.pop.full`) does not have expected columns 'part_age' and 'population'.")
+             }
+
+             pop_dist <- pop_dist[!is.na(part_age) & !is.na(population)] # Clean NAs
+             total_pop <- sum(pop_dist$population, na.rm=TRUE)
+             if (total_pop > 0) {
+                 pop_dist[, prop_pop := population / total_pop]
+
+                 # Merge and calculate weight factor
+                 weight_data <- merge(part_dist[, .(part_age, prop_survey)],
+                                      pop_dist[, .(part_age, prop_pop)],
+                                      by = "part_age", all.x = TRUE) # Keep all participant ages
+                 # If pop data is missing for an age group present in survey, assign zero weight factor? Or 1? contact_matrix implies 0.
+                 weight_data[is.na(prop_pop), prop_pop := 0]
+                 weight_data[prop_survey == 0, weight_factor := 0] # Avoid division by zero if survey N=0 for an age
+                 weight_data[prop_survey > 0, weight_factor := prop_pop / prop_survey]
+
+                 # Apply weight factor to participants
+                 survey_data$participants <- merge(survey_data$participants,
+                                                   weight_data[, .(part_age, weight_factor)],
+                                                   by = "part_age", all.x = TRUE)
+                 # If weight_factor is NA (e.g., part_age was NA), keep original weight
+                  survey_data$participants[!is.na(weight_factor), calculated_weight := calculated_weight * weight_factor]
+                 survey_data$participants[, weight_factor := NULL] # Clean up
+                 message("Applied age weighting.")
+             } else {
+                  warning("Total population in `survey.pop.full` is zero. Cannot perform age weighting.")
+             }
+         }
+     } else {
+          warning("Could not perform age weighting. Check `survey.pop` processing and `part_age` presence.")
+     }
+ }
+
+ # User-defined weights
+ if (!is.null(user_weights)) {
+    missing_user_weights <- setdiff(user_weights, names(survey_data$participants))
+    if (length(missing_user_weights) > 0) {
+        warning("User weight columns not found in participant data: ", paste(missing_user_weights, collapse=", "), ". Ignoring these.")
+    }
+    valid_user_weights <- intersect(user_weights, names(survey_data$participants))
+     if (length(valid_user_weights) > 0) {
+         applied_weights_log <- c()
+         for (w_col in valid_user_weights) {
+            if(!is.numeric(survey_data$participants[[w_col]])) {
+                warning("User weight column '", w_col, "' is not numeric. Skipping.")
+                next
+            }
+            # Handle potential NAs in user weight column - treat as weight=1? Or 0? Assume 1.
+             survey_data$participants[is.na(get(w_col)), (w_col) := 1]
+             # Apply weight
+             survey_data$participants[, calculated_weight := calculated_weight * get(w_col)]
+             applied_weights_log <- c(applied_weights_log, w_col)
+         }
+         if (length(applied_weights_log) > 0) {
+            message("Applied user-defined weights: ", paste(applied_weights_log, collapse=", "))
+         }
+     }
+ }
+
+ # Post-stratification standardization by age group (if age.group exists)
+ if ("age.group" %in% names(survey_data$participants)) {
+    # Calculate sum of weights per group, handle cases where sum is 0
+    survey_data$participants[, sum_weight_group := sum(calculated_weight, na.rm=TRUE), by = age.group]
+    survey_data$participants[sum_weight_group > 0, calculated_weight := calculated_weight / sum_weight_group * .N]
+    # Set weight to 0 if the group sum was 0 or if individual weight was NA initially
+     survey_data$participants[sum_weight_group <= 0 | is.na(calculated_weight), calculated_weight := 0]
+    survey_data$participants[, sum_weight_group := NULL] # Clean up
+    message("Standardized weights by participant age group.")
+ } else {
+    message("Participant age group column ('age.group') not found/created, skipping weight standardization by age group.")
+ }
+
+ # Weight truncation
+ if (!is.null(weight.threshold) && !is.na(weight.threshold)) {
+     truncated_count <- sum(survey_data$participants$calculated_weight > weight.threshold, na.rm=TRUE)
+     if (truncated_count > 0) {
+         survey_data$participants[calculated_weight > weight.threshold, calculated_weight := weight.threshold]
+         message(paste("Truncated", truncated_count, "weights at threshold:", weight.threshold))
+
+         # Re-normalize after truncation if age groups exist
+         if ("age.group" %in% names(survey_data$participants)) {
+             survey_data$participants[, sum_weight_group := sum(calculated_weight, na.rm=TRUE), by = age.group]
+             survey_data$participants[sum_weight_group > 0, calculated_weight := calculated_weight / sum_weight_group * .N]
+             survey_data$participants[sum_weight_group <= 0 | is.na(calculated_weight), calculated_weight := 0]
+             survey_data$participants[, sum_weight_group := NULL] # Clean up
+             message("Re-standardized weights by age group after truncation.")
+         } else {
+             # Global re-normalization if no age groups
+             total_weight_after_trunc <- sum(survey_data$participants$calculated_weight, na.rm=TRUE)
+             total_participants <- nrow(survey_data$participants)
+             if (total_weight_after_trunc > 0 && total_participants > 0) {
+                 survey_data$participants[, calculated_weight := calculated_weight / total_weight_after_trunc * total_participants]
+                 message("Re-standardized weights globally after truncation (no age groups).")
+             } else {
+                 message("Total weight or participant count is zero after truncation, cannot re-standardize globally.")
+                 survey_data$participants[, calculated_weight := 0]
+             }
+         }
+     } else {
+         message("No weights exceeded the truncation threshold.")
+     }
+ }
+
+
+ # --- 1d. Merge Weights and Prepare for Aggregation ---
+ # Select only necessary columns from participants for merge: part_id and calculated_weight
+ participant_weights_to_merge <- survey_data$participants[, .(part_id, calculated_weight)]
+
+ # Merge participant dimensions onto contacts data
+ part_dims_to_merge <- intersect(required_participant_cols, names(survey_data$participants))
+ # Ensure part_id is always included for merge, plus other required part_ dimensions
+ merge_cols_participants <- unique(c("part_id", part_dims_to_merge))
+
+ # Select required contact dimensions + part_id
+ merge_cols_contacts <- unique(c("part_id", required_contact_cols))
+ contacts_to_merge <- survey_data$contacts[, ..merge_cols_contacts]
+
+ # Merge contact data with participant dimensions
+ gam_data_full <- merge(
+      contacts_to_merge,
+      survey_data$participants[, ..merge_cols_participants],
+      by = "part_id",
+      all.x = FALSE # Keep only contacts with matching participants (already filtered)
+ )
+ # Merge calculated weights onto the combined data
+ gam_data_full <- merge(
+     gam_data_full,
+     participant_weights_to_merge,
+     by = "part_id",
+     all.x = FALSE # Should not lose rows if weights calculated correctly for all participants
+ )
+
   # Check if all dimensions are now in the merged data
-   missing_dims_in_merged <- setdiff(dimensions, names(gam_data_full))
-   if (length(missing_dims_in_merged) > 0) {
-       stop(paste("Internal error: After merging, the following dimensions are missing:",
-                 paste(missing_dims_in_merged, collapse=", ")))
-   }
+  missing_dims_in_merged <- setdiff(dimensions, names(gam_data_full))
+  if (length(missing_dims_in_merged) > 0) {
+      stop(paste("Internal error: After merging, the following dimensions are missing:",
+                paste(missing_dims_in_merged, collapse=", ")))
+  }
 
-   # Convert character dimensions to factors for GAM compatibility if needed
-   for(dim_name in dimensions) {
-       if(is.character(gam_data_full[[dim_name]])) {
-           message(paste("Converting character dimension", dim_name, "to factor."))
-           gam_data_full[, (dim_name) := as.factor(get(dim_name))]
-       }
-   }
+  # Convert character dimensions to factors for GAM compatibility if needed
+  for(dim_name in dimensions) {
+      if(is.character(gam_data_full[[dim_name]])) {
+          message(paste("Converting character dimension", dim_name, "to factor."))
+          # Ensure levels used match dim_breaks if provided
+           if(dim_name %in% names(dim_breaks) && !is.numeric(dim_breaks[[dim_name]])) {
+                gam_data_full[, (dim_name) := factor(get(dim_name), levels = dim_breaks[[dim_name]])]
+           } else {
+               gam_data_full[, (dim_name) := as.factor(get(dim_name))]
+           }
+      } else if (is.factor(gam_data_full[[dim_name]])) {
+          # If already factor, ensure levels match dim_breaks if specified
+           if(dim_name %in% names(dim_breaks) && !is.numeric(dim_breaks[[dim_name]])) {
+                current_levels <- levels(gam_data_full[[dim_name]])
+                target_levels <- dim_breaks[[dim_name]]
+                if (!identical(current_levels, target_levels)) {
+                   message(paste("Re-leveling factor", dim_name, "to match dim_breaks"))
+                   gam_data_full[, (dim_name) := factor(get(dim_name), levels = target_levels)]
+                }
+           }
+      }
+  }
 
 
-  # Aggregate contacts: Count N contacts for each combination of participant & contact characteristics
-  grouping_vars <- dimensions
-  gam_data_agg <- gam_data_full[, .N, by = c(grouping_vars)]
+ # Aggregate contacts: Calculate SUM of weights and count (N) for each combination
+ # The sum of weights becomes the response variable.
+ # N (number of raw contacts in the bin) will be used as the weight argument in gam().
+ grouping_vars <- dimensions
+ message("Aggregating contact data by specified dimensions...")
+ gam_data_agg <- gam_data_full[, .(response = sum(calculated_weight, na.rm = TRUE), N = .N), by = c(grouping_vars)]
+ message(paste("Aggregated data has", nrow(gam_data_agg), "rows."))
+
+ # Check for zero counts - these might indicate issues or sparse data
+ if (any(gam_data_agg$N == 0)) {
+     warning("Some aggregated bins have N=0 contacts. This might affect model fitting if weights are based on N.")
+     # Consider removing rows with N=0 if they cause issues?
+     # gam_data_agg <- gam_data_agg[N > 0]
+ }
+ # Check for zero response (sum of weights)
+ if (any(gam_data_agg$response == 0 & gam_data_agg$N > 0)) {
+      warning("Some aggregated bins have N > 0 but sum of weights (response) is 0. Check weight calculations.")
+ }
 
 
   # --- 2. Build or Use GAM Formula ---
+  formula_string_to_return <- NULL # Initialize
   if (is.null(gam_formula)) {
-    # --- Build GAM Formula Automatically (Default: includes interactions) ---
-    message("Building GAM formula automatically (default includes num-cat interactions)...")
+    # --- Build GAM Formula Automatically ---
+    message("Building GAM formula automatically (response ~ terms)...")
     formula_terms <- c()
 
     # Check argument validity
@@ -1147,80 +1525,128 @@ gam_contact_matrix <- function(survey,
                                paste0("te(", part_var, ", ", cnt_var,
                                       ", k = c(", k_tensor[1], ", ", k_tensor[2], "), bs = \"", bs_numeric, "\")"))
          } else { # Categorical pair (e.g., gender, ethnicity)
-             formula_terms <- c(formula_terms,
-                               paste0("interaction(", part_var, ", ", cnt_var, ")"))
+             # Check if factors have enough levels for interaction
+              part_levels = levels(gam_data_agg[[part_var]])
+              cnt_levels = levels(gam_data_agg[[cnt_var]])
+              if(length(part_levels) < 2 || length(cnt_levels) < 2) {
+                  warning(paste("Categorical pair", suffix, "has less than 2 levels in aggregated data. Interaction term might be problematic. Using simple factor terms instead."))
+                  formula_terms <- c(formula_terms, part_var, cnt_var) # Add main effects only
+              } else {
+                 formula_terms <- c(formula_terms,
+                                  paste0("interaction(", part_var, ", ", cnt_var, ")"))
+              }
          }
     }
 
     # Add smooths for numeric variables varying by interactions of categorical variables
     if (length(numeric_suffixes) > 0 && length(categorical_suffixes) > 0) {
         # Create interaction term string for all categorical pairs
-        # Needs careful construction if > 1 categorical pair
-        if (length(categorical_suffixes) == 1) {
-             sfx <- categorical_suffixes[1]
-             by_var_str <- paste0("interaction(", paste0("part_", sfx), ", ", paste0("cnt_", sfx), ")")
-        } else {
-            # Create nested interactions: interaction(p_g,c_g):interaction(p_e,c_e) etc.
-             individual_interactions <- sapply(categorical_suffixes, function(sfx) {
-                paste0("interaction(", paste0("part_", sfx), ", ", paste0("cnt_", sfx), ")")
-             })
-             by_var_str <- paste(individual_interactions, collapse = ":")
+        categorical_interaction_terms <- c()
+        valid_categorical_suffixes_for_by <- c() # Store suffixes with >1 level for 'by'
+        for (sfx in categorical_suffixes) {
+            part_cat_var <- paste0("part_", sfx)
+            cnt_cat_var <- paste0("cnt_", sfx)
+            # Ensure factors have sufficient levels in the aggregated data
+             part_levels = levels(gam_data_agg[[part_cat_var]])
+             cnt_levels = levels(gam_data_agg[[cnt_cat_var]])
+             if (length(part_levels) >= 1 && length(cnt_levels) >= 1) { # Need at least 1 level to form term
+                 categorical_interaction_terms <- c(categorical_interaction_terms, paste0("interaction(", part_cat_var, ", ", cnt_cat_var, ")"))
+                 if (length(part_levels) >= 2 || length(cnt_levels) >= 2) { # Need >1 level somewhere for 'by' to make sense
+                      valid_categorical_suffixes_for_by <- c(valid_categorical_suffixes_for_by, sfx)
+                 }
+             } else {
+                  warning(paste("Skipping categorical pair", sfx, "from 'by' interaction due to insufficient levels."))
+             }
         }
 
-        for (num_suffix in numeric_suffixes) {
-            part_num_var <- paste0("part_", num_suffix)
-            cnt_num_var <- paste0("cnt_", num_suffix)
+        if (length(categorical_interaction_terms) > 0 && length(valid_categorical_suffixes_for_by) > 0) {
+             by_var_str <- paste(categorical_interaction_terms, collapse = ":") # Combine all interactions
 
-            # Add s(..., by = ...) terms
-            formula_terms <- c(formula_terms,
-                              paste0("s(", part_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
-            formula_terms <- c(formula_terms,
-                              paste0("s(", cnt_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+             for (num_suffix in numeric_suffixes) {
+                 part_num_var <- paste0("part_", num_suffix)
+                 cnt_num_var <- paste0("cnt_", num_suffix)
+
+                 # Add s(..., by = ...) terms
+                 formula_terms <- c(formula_terms,
+                                   paste0("s(", part_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+                 formula_terms <- c(formula_terms,
+                                   paste0("s(", cnt_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+             }
+        } else {
+             warning("Could not create valid 'by' interaction term for smooths. Adding simple numeric smooths instead.")
+             # Add simple smooths if 'by' interaction failed
+             for (num_suffix in numeric_suffixes) {
+                part_num_var <- paste0("part_", num_suffix)
+                cnt_num_var <- paste0("cnt_", num_suffix)
+                # Add only if not already covered by te() - though te() doesn't strictly include marginals
+                # Typically, we *do* want the marginal smooths alongside the te()
+                formula_terms <- c(formula_terms,
+                                   paste0("s(", part_num_var, ", k = ", k_tensor[1], ", bs = \"", bs_numeric, "\")"))
+                formula_terms <- c(formula_terms,
+                                   paste0("s(", cnt_num_var, ", k = ", k_tensor[2], ", bs = \"", bs_numeric, "\")"))
+             }
         }
     } else if (length(numeric_suffixes) > 0) {
          # If only numeric dimensions, add simple smooths (main effects to complement te())
          for (num_suffix in numeric_suffixes) {
             part_num_var <- paste0("part_", num_suffix)
             cnt_num_var <- paste0("cnt_", num_suffix)
-             formula_terms <- c(formula_terms,
+            # Add marginal smooths
+            formula_terms <- c(formula_terms,
                                paste0("s(", part_num_var, ", k = ", k_tensor[1], ", bs = \"", bs_numeric, "\")"))
-             formula_terms <- c(formula_terms,
+            formula_terms <- c(formula_terms,
                                paste0("s(", cnt_num_var, ", k = ", k_tensor[2], ", bs = \"", bs_numeric, "\")"))
          }
     }
 
-    # Assemble final formula string
+    # Assemble final formula string - USING 'response' as the outcome
     if (length(formula_terms) == 0) {
         stop("Could not generate any terms for the GAM formula based on dimensions.")
     }
-    formula_str <- paste("N ~", paste(formula_terms, collapse = " + "))
-    gam_formula_generated <- as.formula(formula_str)
-    message("Generated GAM formula: ", formula_str)
-    formula_to_use <- gam_formula_generated
+    formula_str_generated <- paste("response ~", paste(unique(formula_terms), collapse = " + ")) # Use unique terms
+    message("Generated GAM formula: ", formula_str_generated)
+    formula_to_use <- as.formula(formula_str_generated) # Convert to formula for gam()
+    formula_string_to_return <- formula_str_generated # Keep string for return
   } else {
     # --- Use Provided GAM Formula ---
      if (!inherits(gam_formula, "formula")) {
         stop("`gam_formula` must be a formula object or NULL.")
      }
-     message("Using provided GAM formula.")
+     # Check if formula uses 'response' as outcome, warn if not
+      resp_var <- all.vars(gam_formula[[2]])
+      if (resp_var != "response") {
+          warning("Provided `gam_formula` does not use 'response' as the outcome variable. Fitting will use the sum of weights ('response') regardless.")
+          # Optionally, attempt to substitute 'response' into the formula
+           gam_formula[[2]] <- quote(response)
+      }
+     message("Using provided GAM formula (ensuring outcome is 'response').")
      formula_to_use <- gam_formula
-     # Set generated formula to NA if formula provided by user
-     gam_formula_generated <- NA
+     formula_string_to_return <- deparse(formula_to_use) # Store provided formula as string
   }
 
 
   # --- 3. Fit GAM ---
-  message("Fitting GAM model...")
+  message("Fitting GAM model (using N as weights)...")
+  # Use 'N' (raw contact count in bin) as weights argument for gam
+  # This assumes the 'response' (sum of weights) scales with N,
+  # and gives more importance to bins with more raw contacts.
+  if (!"N" %in% names(gam_data_agg)) {
+      stop("Internal error: Aggregated data does not contain 'N' column for GAM weights.")
+  }
+  gam_weights <- gam_data_agg$N
+
   gam_fit <- mgcv::gam(
-      formula = formula_to_use, # Use the generated or provided formula
+      formula = formula_to_use, # Uses 'response' as outcome
       data = gam_data_agg,
-      family = family,
-      method = "REML", # Default method, often robust
-      ...             # Pass additional args to gam
+      family = family,       # Family describes error distribution of 'response'
+      weights = gam_weights, # Use raw count N as weights
+      method = "REML",       # Default method, often robust
+      ...                    # Pass additional args to gam
   )
   message("GAM fitting complete.")
 
   # --- 4. Create Prediction Grid ---
+  message("Creating prediction grid...")
   prediction_grid_list <- lapply(dimensions, function(dim_name) {
     breaks <- dim_breaks[[dim_name]]
     if (is.numeric(breaks)) {
@@ -1232,17 +1658,34 @@ gam_contact_matrix <- function(survey,
        # Ensure levels used for prediction match factor levels in fitted data
        if (is.factor(gam_data_agg[[dim_name]])) {
            data_levels <- levels(gam_data_agg[[dim_name]])
-            provided_levels <- as.character(breaks)
+            provided_levels <- as.character(breaks) # breaks should be the levels
             if (!all(provided_levels %in% data_levels)) {
                  warning(paste("Some levels provided in dim_breaks for", dim_name,
                               "are not present in the modeling data factors:",
-                               paste(setdiff(provided_levels, data_levels), collapse=", ")))
+                               paste(setdiff(provided_levels, data_levels), collapse=", "),
+                               ". Prediction for these levels might be unreliable or produce errors."))
             }
              # Return factor with levels matching data, subsetted by provided breaks
+             # Using data_levels ensures consistency with the model fit
              return(factor(provided_levels, levels=data_levels))
 
+       } else if (is.character(breaks)) {
+            # If input was character and converted to factor in data prep, use factor levels from data
+            if (is.factor(gam_data_agg[[dim_name]])) {
+                 data_levels <- levels(gam_data_agg[[dim_name]])
+                 provided_levels <- as.character(breaks)
+                 if (!all(provided_levels %in% data_levels)) {
+                     warning(paste("Some levels provided in dim_breaks for character dim", dim_name,
+                              "are not present in the modeling data factors:",
+                               paste(setdiff(provided_levels, data_levels), collapse=", ")))
+                 }
+                  return(factor(provided_levels, levels=data_levels))
+            } else {
+                # If it remained character (unlikely), use breaks directly
+                 return(breaks)
+            }
        } else {
-            return(breaks) # Assume character otherwise
+            stop(paste("Unsupported break type for dimension:", dim_name))
        }
     }
   })
@@ -1253,21 +1696,28 @@ gam_contact_matrix <- function(survey,
 
 
   # --- 5. Predict using GAM ---
-  message("Predicting contact rates on grid...")
+  message("Predicting contact rates (sum of weights) on grid...")
   # Need to handle potential missing factor levels between model data and prediction grid
   predicted_values <- tryCatch({
         mgcv::predict.gam(
            gam_fit,
            newdata = prediction_grid,
-           type = "response", # Get predictions on the scale of the response
-           se.fit = FALSE
+           type = "response", # Get predictions on the scale of the response (sum of weights)
+           se.fit = FALSE     # Optionally get standard errors later if needed
        )
     }, error = function(e) {
         # Common error is factor level mismatch
         if (grepl("factor .* has new levels", e$message)) {
-            stop(paste("Error during prediction: Factor level mismatch.",
+            # Identify the problematic factor and levels
+             factor_match <- regmatches(e$message, regexpr("'([^']*)'", e$message))
+             problem_factor <- ifelse(length(factor_match) > 0, factor_match[1], "unknown factor")
+             # Provide more context
+             problematic_levels <- setdiff(levels(prediction_grid[[gsub("'", "", problem_factor)]]), levels(gam_data_agg[[gsub("'", "", problem_factor)]]))
+
+            stop(paste("Error during prediction: Factor level mismatch for", problem_factor, ".",
+                       "Levels in prediction grid not found in model data:", paste(problematic_levels, collapse=", "), ".",
                        "Ensure levels in `dim_breaks` for categorical dimensions",
-                       "exactly match the levels present in the data used for fitting.",
+                       "exactly match the levels present *after aggregation* in the data used for fitting.",
                        "Original error:", e$message), call. = FALSE)
         } else {
             stop(paste("Error during prediction:", e$message), call. = FALSE)
@@ -1283,7 +1733,8 @@ gam_contact_matrix <- function(survey,
        if (is.numeric(breaks)) {
            return(length(breaks) - 1) # Number of intervals
        } else {
-           return(length(breaks)) # Number of levels
+           # Use the number of levels specified in dim_breaks
+            return(length(breaks))
        }
    })
   names(array_dims) <- dimensions # Keep dimension names
@@ -1301,7 +1752,7 @@ gam_contact_matrix <- function(survey,
            }
            return(format_interval(lower, upper))
       } else {
-          # Use factor levels directly
+          # Use levels provided in dim_breaks directly
            return(as.character(breaks))
       }
   })
@@ -1318,14 +1769,19 @@ gam_contact_matrix <- function(survey,
   )
 
   # --- 7. Return Results ---
+  # Assign gam_fit to a temp variable to avoid potential naming conflicts
+  final_gam_fit <- gam_fit
+  # Include the generated formula string in the return list
+  final_formula_string <- formula_string_to_return
+
   return(
     list(
-      matrix = contact_array,
-      gam_fit = gam_fit,
+      matrix = contact_array, # This now represents predicted sum of weights
+      gam_fit = final_gam_fit,
       prediction_grid = prediction_grid,
       dimensions = dimensions,
       dim_breaks = dim_breaks,
-      gam_formula = gam_formula_generated # Return the generated formula (NA if provided)
+      gam_formula_str = final_formula_string # Return the formula string used
     )
   )
 }
@@ -1333,4 +1789,7 @@ gam_contact_matrix <- function(survey,
 # Helper function (if not already present) - reduce_agegroups
 # Ensure this exists or is defined if needed by other parts of contact_matrix.R
 # reduce_agegroups <- function(ages, limits) { ... }
+
+# Ensure pop_age exists if weigh.age=TRUE
+# It should be available if socialmixr is loaded, but good practice to note dependency.
 
