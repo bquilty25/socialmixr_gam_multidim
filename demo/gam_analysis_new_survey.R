@@ -19,12 +19,12 @@ message("Loading survey data...")
 # Example:
 # new_survey_data <- readRDS("path/to/your/survey_data.rds")
 # Or load from other formats and convert using survey()
-new_survey_data <- NULL # Placeholder
+new_survey_data <- readRDS('data/connect_survey.rds')
 
 # Check if data is loaded
-if (is.null(new_survey_data) || !inherits(new_survey_data, "contact_survey")) {
-  stop("Failed to load survey data or data is not a contact_survey object. Please check the loading step.")
-}
+# if (is.null(new_survey_data) || !inherits(new_survey_data, "contact_survey")) {
+#   stop("Failed to load survey data or data is not a contact_survey object. Please check the loading step.")
+# }
 message("Survey data loaded.")
 
 # Ensure the gam_contact_matrix function is available
@@ -56,8 +56,8 @@ dimensions_age_eth <- c("part_age", "cnt_age", "part_ethnicity", "cnt_ethnicity"
 dim_breaks_age_eth <- list(
   part_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
   cnt_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
-  part_ethnicity = c("Group A", "Group B", "Group C", "Other"), # Replace with actual factor levels
-  cnt_ethnicity = c("Group A", "Group B", "Group C", "Other")  # Replace with actual factor levels
+  part_ethnicity = c('White','Asian','Black','Mixed','Other'), # Replace with actual factor levels
+  cnt_ethnicity = c('White','Asian','Black','Mixed','Other')  # Replace with actual factor levels
 )
 
 # Run gam_contact_matrix for Age x Ethnicity
@@ -132,6 +132,36 @@ if (!is.null(gam_results_age_eth)) {
   # --- Save Age x Ethnicity Outputs ---
   output_dir_age_eth <- "output/gam_analysis/age_ethnicity"
   dir.create(output_dir_age_eth, recursive = TRUE, showWarnings = FALSE)
+  
+  plot_data_age_eth <- arrange(plot_data_age_eth, part_age, cnt_age)
+  plot_data_age_eth$part_age_group <- factor(plot_data_age_eth$part_age_group, levels = rev(unique(plot_data_age_eth$part_age_group)))
+  plot_data_age_eth$cnt_age_group <- factor(plot_data_age_eth$cnt_age_group, levels = unique(plot_data_age_eth$cnt_age_group))
+  
+  flattened_matrix <- ggplot(plot_data_age_eth, 
+                             aes(x = part_ethnicity, y = cnt_ethnicity, fill = predicted_contacts)) + 
+    geom_tile(colour = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "plasma", name = "Mean contacts", 
+                         limits = c(0, max(plot_data$predicted_contacts, na.rm = TRUE)),
+                         trans = scales::pseudo_log_trans(sigma = 2), breaks = c(0,1,2,3,4,5,6)) +
+    labs(
+      title = sprintf("Mean Contacts: Age Group x Ethnicity"),
+      subtitle = paste("Model: GAM (Tensor Spline + Ethnicity Interaction)"),
+      x = "Participant",
+      y = "Contact"
+    ) +
+    theme_minimal(base_size = 10) +
+    facet_grid(part_age_group ~ cnt_age_group, switch = 'both') + 
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size=7),
+      axis.text.y = element_text(size=7),
+      legend.position = "right",
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      panel.spacing = unit(0, "lines"), 
+      strip.background = element_blank(),
+      strip.placement = "outside"
+    )
+  ggsave(paste0(output_dir_age_eth/, "flattened_matrix.png"), plot = flattened_matrix, width = 12, height = 10, dpi = 600, bg="white")
 
   plot_filename_base_age_eth <- file.path(output_dir_age_eth, paste0("gam_contact_matrix_age_ethnicity", ifelse(!is.null(target_country), paste0("_", target_country), "")))
   ggsave(paste0(plot_filename_base_age_eth, ".png"), plot = p_age_eth, width = 10, height = 8, dpi = 600, bg = "white")

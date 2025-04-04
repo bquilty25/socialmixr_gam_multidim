@@ -133,6 +133,40 @@ if (!is.null(gam_results)) {
     plots_list[[paste(p_gender, c_gender, sep = "_")]] <- p
 
   }
+  
+  plot_data <- arrange(plot_data, part_age, cnt_age)
+  
+  plot_data <- plot_data %>% mutate(x_var = paste0(part_age_group, '_', part_gender),
+                                    y_var = paste0(cnt_age_group, '_', cnt_gender))
+  
+  plot_data$part_age_group <- factor(plot_data$part_age_group, levels = rev(unique(plot_data$part_age_group)))
+  plot_data$cnt_age_group <- factor(plot_data$cnt_age_group, levels = unique(plot_data$cnt_age_group))
+  
+  flattened_matrix <- ggplot(plot_data, 
+         aes(x = part_gender, y = cnt_gender, fill = predicted_contacts)) + 
+    geom_tile(colour = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "plasma", name = "Mean contacts", 
+                         limits = c(0, max(plot_data$predicted_contacts, na.rm = TRUE)),
+                         trans = scales::pseudo_log_trans(sigma = 2), breaks = c(0,1,2,3,4,5,6)) +
+    labs(
+      title = sprintf("Mean Contacts: Age Group x Gender"),
+      subtitle = paste("Country:", target_country, "| Model: GAM (Tensor Spline + Gender Interaction)"),
+      x = "Participant",
+      y = "Contact"
+    ) +
+    theme_minimal(base_size = 10) +
+    facet_grid(part_age_group ~ cnt_age_group, switch = 'both') + 
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size=7),
+      axis.text.y = element_text(size=7),
+      legend.position = "right",
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      panel.spacing = unit(0, "lines"), 
+      strip.background = element_blank(),
+      strip.placement = "outside"
+    )
+  ggsave(paste0(plot_filename_base, "_flattened_matrix.png"), plot = flattened_matrix, width = 12, height = 10, dpi = 600, bg="white")
 
   # Arrange plots using patchwork
   if (length(plots_list) == 4) {
@@ -168,3 +202,17 @@ if (!is.null(gam_results)) {
 }
 
 message("\nDemo script finished.") 
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
