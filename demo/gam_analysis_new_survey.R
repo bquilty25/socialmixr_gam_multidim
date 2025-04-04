@@ -49,6 +49,15 @@ new_survey_data$contacts <- new_survey_data$contacts[cnt_ethnicity != cnt_filter
 filtered_cnt_rows <- nrow(new_survey_data$contacts)
 message(paste("-> Removed", initial_cnt_rows - filtered_cnt_rows, "contacts with ethnicity '", cnt_filter_level, "'."))
 
+# --- Filter out 'Prefer not to say' Gender (Contacts Only) ---
+message("Filtering out 'Prefer not to say' contact gender...")
+part_gender_filter_level <- "Prefer not to say" # Define level
+initial_cnt_gender_rows <- nrow(new_survey_data$contacts)
+new_survey_data$contacts <- new_survey_data$contacts[cnt_gender != part_gender_filter_level]
+filtered_cnt_gender_rows <- nrow(new_survey_data$contacts)
+message(paste("-> Removed", initial_cnt_gender_rows - filtered_cnt_gender_rows, "contacts with gender '", part_gender_filter_level, "'."))
+# ------------------------------------------------------------
+
 # Ensure consistency: Remove contacts whose participant was filtered out
 part_ids_remaining <- unique(new_survey_data$participants$part_id)
 contacts_before_consistency <- nrow(new_survey_data$contacts)
@@ -509,6 +518,206 @@ if (!is.null(gam_results_age_ses)) {
 
 } else {
   message("\nAge x SES GAM analysis failed. No results to process or compare.")
+}
+
+# --- Analysis 3: Age x Gender --- # ADDING NEW ANALYSIS
+message("\n--- Starting Analysis 3: Age x Gender ---")
+
+# Define dimensions for Age x Gender
+dimensions_age_gender <- c("part_age", "cnt_age", "part_gender", "cnt_gender")
+
+# !!! MOVED: Define breaks AFTER filtering !!!
+# Get actual gender levels from the *filtered* data
+part_gender_levels <- levels(droplevels(new_survey_data$participants$part_gender))
+cnt_gender_levels <- levels(droplevels(new_survey_data$contacts$cnt_gender)) # Use filtered contacts gender
+message("Using filtered gender levels for breaks:")
+message(" Part levels: ", paste(part_gender_levels, collapse=", "))
+message(" Cont levels: ", paste(cnt_gender_levels, collapse=", "))
+
+dim_breaks_age_gender <- list(
+  part_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
+  cnt_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
+  part_gender = part_gender_levels,
+  cnt_gender = cnt_gender_levels
+)
+# !!! ------------------------------------ !!!
+
+# Run gam_contact_matrix for Age x Gender
+gam_results_age_gender <- tryCatch({
+  gam_contact_matrix(
+    survey = new_survey_data,
+    countries = target_country,
+    dimensions = dimensions_age_gender,
+    dim_breaks = dim_breaks_age_gender,
+    family = gam_family_setting,
+    age_limits = analysis_age_limits,
+    k_tensor = k_tensor_setting,
+    bs_numeric = bs_numeric_setting,
+    use_bam = TRUE # Use bam for gender
+  )
+}, error = function(e) {
+  message("Error running gam_contact_matrix for Age x Gender: ", e$message)
+  return(NULL)
+})
+
+# --- Process and Visualize Age x Gender Results ---
+if (!is.null(gam_results_age_gender)) {
+  message("Age x Gender GAM analysis complete. Processing results...")
+
+  # Extract matrix and prediction grid
+  predicted_matrix_age_gender <- gam_results_age_gender$matrix
+  plot_data_age_gender <- gam_results_age_gender$prediction_grid
+  plot_data_age_gender$predicted_contacts <- as.vector(predicted_matrix_age_gender)
+  setDT(plot_data_age_gender)
+  message("-> Gender Results extracted.")
+
+  cat("\nDimensions of the Age x Gender predicted matrix:\n")
+  print(dim(predicted_matrix_age_gender))
+  print(dimnames(predicted_matrix_age_gender))
+
+  # Generate age labels (reusing from above if breaks are the same)
+  message("-> Gender Age labels reused.")
+  # Factorise age groups for plotting (reusing from above if breaks are the same)
+  plot_data_age_gender[, part_age_group := factor(paste0("[", findInterval(part_age, dim_breaks_age_gender$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dim_breaks_age_gender$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
+  plot_data_age_gender[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dim_breaks_age_gender$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dim_breaks_age_gender$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+  message("-> Gender Age groups factorised.")
+
+  # --- Visualization (Example: Facet wrap by Gender pair) ---
+  message("\nCreating Age x Gender visualisations...")
+  # Ensure factor levels match dim_breaks for faceting labels
+  gender_levels_part <- dim_breaks_age_gender$part_gender
+  gender_levels_cnt <- dim_breaks_age_gender$cnt_gender
+  plot_data_age_gender[, part_gender := factor(part_gender, levels = gender_levels_part)]
+  plot_data_age_gender[, cnt_gender := factor(cnt_gender, levels = gender_levels_cnt)]
+
+  message("-> Creating p_age_gender plot object...")
+  p_age_gender <- ggplot(plot_data_age_gender, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
+    geom_tile(colour = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts",
+                         na.value = "grey80", trans = scales::log10_trans()) + # Use log10 trans
+    facet_grid(cnt_gender ~ part_gender, labeller = labeller(.default = label_both, .multi_line = TRUE)) +
+    labs(
+      title = "Predicted Contacts: Age x Gender",
+      subtitle = paste(ifelse(!is.null(target_country), paste("Country:", target_country), "All Countries"),
+                     "| Model: BAM (Age-Age Tensor + Gender Interaction)"), # Updated model name
+      x = "Participant Age Group",
+      y = "Contact Age Group"
+    ) +
+    theme_minimal(base_size = 9) +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+      axis.text.y = element_text(size = 6),
+      legend.position = "right",
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 10),
+      strip.text = element_text(size = 8, face = "bold")
+    )
+  message("-> p_age_gender plot object created.")
+
+  # --- Save Age x Gender Outputs ---
+  output_dir_age_gender <- "output/gam_analysis/age_gender"
+  dir.create(output_dir_age_gender, recursive = TRUE, showWarnings = FALSE)
+
+  # --- Create and Save Flattened Gender plot ---
+  message("-> Preparing data for flattened Gender matrix...")
+  plot_data_age_gender_flat <- copy(plot_data_age_gender)
+  # Ensure factor levels are ordered correctly for faceting
+  plot_data_age_gender_flat$part_age_group <- factor(plot_data_age_gender_flat$part_age_group, levels = age_labels_part)
+  plot_data_age_gender_flat$cnt_age_group <- factor(plot_data_age_gender_flat$cnt_age_group, levels = age_labels_cnt)
+  # Reverse the factor levels for contact age group to flip facet order
+  plot_data_age_gender_flat$cnt_age_group <- factor(plot_data_age_gender_flat$cnt_age_group, levels = rev(age_labels_cnt))
+
+  message("-> Creating p_age_gender_flattened plot object...")
+  p_age_gender_flattened <- ggplot(plot_data_age_gender_flat,
+                                aes(x = part_gender, y = cnt_gender, fill = predicted_contacts)) +
+    geom_tile(colour = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "plasma", name = "Mean contacts",
+                         na.value="grey80", trans = scales::log10_trans()) + # Use log10 trans
+    labs(
+      title = sprintf("Mean Contacts: Age Group x Gender"),
+      subtitle = paste("Model: BAM (Tensor Spline + Gender Interaction)"),
+      x = "Participant Gender",
+      y = "Contact Gender"
+    ) +
+    theme_minimal(base_size = 10) +
+    facet_grid(cnt_age_group ~ part_age_group, switch = 'both') +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size=7),
+      axis.text.y = element_text(size=7),
+      legend.position = "right",
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      panel.spacing = unit(0, "lines"),
+      strip.background = element_blank(),
+      strip.placement = "outside"
+    )
+  message("-> p_age_gender_flattened plot object created.")
+
+  message("-> Saving p_age_gender_flattened plot...")
+  plot_filename_flat_age_gender <- file.path(output_dir_age_gender, paste0("gam_contact_matrix_age_gender_flattened", ifelse(!is.null(target_country), paste0("_", target_country), ""), ".png"))
+  ggsave(plot_filename_flat_age_gender, plot = p_age_gender_flattened, width = 12, height = 10, dpi = 600, bg="white")
+  plot_filename_flat_age_gender_pdf <- sub(".png$", ".pdf", plot_filename_flat_age_gender)
+  ggsave(plot_filename_flat_age_gender_pdf, plot = p_age_gender_flattened, width = 12, height = 10, dpi = 600, bg="white")
+  message(paste("-> Flattened Age x Gender plot saved to:", plot_filename_flat_age_gender, "and .pdf"))
+  # --------------------------------------
+
+  plot_filename_base_age_gender <- file.path(output_dir_age_gender, paste0("gam_contact_matrix_age_gender", ifelse(!is.null(target_country), paste0("_", target_country), "")))
+  message("-> Saving p_age_gender plots...")
+  ggsave(paste0(plot_filename_base_age_gender, ".png"), plot = p_age_gender, width = 10, height = 8, dpi = 600, bg = "white")
+  ggsave(paste0(plot_filename_base_age_gender, ".pdf"), plot = p_age_gender, width = 10, height = 8, dpi = 600, bg = "white")
+  message(paste("-> Age x Gender plot saved to:", paste0(plot_filename_base_age_gender, ".png/.pdf")))
+
+  rds_filename_age_gender <- file.path(output_dir_age_gender, paste0("gam_results_age_gender", ifelse(!is.null(target_country), paste0("_", target_country), ""), ".rds"))
+  message("-> Saving Gender RDS object...")
+  saveRDS(gam_results_age_gender, file = rds_filename_age_gender)
+  message(paste("-> Age x Gender GAM results object saved to:", rds_filename_age_gender))
+
+  # --- Compare Models (Age x Gender) --- #
+  message("\nComparing GAM models for Age x Gender...")
+  # Similar logic as for Ethnicity/SES
+  main_formula_gender_str <- deparse(gam_results_age_gender$gam_formula)
+  # Note: Assumes the interaction column is named 'gender_interaction'
+  simple_formula_gender_str <- gsub("\\s*\\+\\s*gender_interaction", "", main_formula_gender_str)
+
+  if (simple_formula_gender_str != main_formula_gender_str) {
+      simple_formula_gender <- as.formula(simple_formula_gender_str)
+      message("Fitting simpler Age x Gender model with formula: ", simple_formula_gender_str)
+
+      gam_results_simple_gender <- tryCatch({
+          simpler_model_gender <- mgcv::bam(
+              formula = simple_formula_gender,
+              data = gam_results_age_gender$fitting_data, # Use fitting data returned by function
+              family = gam_family_setting,
+              method = "fREML",
+              discrete = TRUE
+          )
+          message("Simpler model fitted.")
+          list(gam_fit = simpler_model_gender)
+      }, error = function(e) {
+          message("Error fitting simpler Age x Gender model: ", e$message)
+          return(NULL)
+      })
+
+      if (!is.null(gam_results_simple_gender)) {
+          aic_full_gender <- AIC(gam_results_age_gender$gam_fit)
+          aic_simple_gender <- AIC(gam_results_simple_gender$gam_fit)
+          message(paste("AIC (Full Age x Gender Model):", round(aic_full_gender, 2)))
+          message(paste("AIC (Simple Age x Gender Model):", round(aic_simple_gender, 2)))
+          if (aic_full_gender < aic_simple_gender) {
+              message("Full model (with Gender interaction) has lower AIC.")
+          } else {
+              message("Simpler model (without Gender interaction) has lower AIC.")
+          }
+      } else {
+          message("Could not fit simpler model for Age x Gender, skipping AIC comparison.")
+      }
+  } else {
+      message("Could not derive simpler formula for Age x Gender, skipping comparison.")
+  }
+  # --- End Comparison --- #
+
+} else {
+  message("\nAge x Gender GAM analysis failed. No results to process or compare.")
 }
 
 message("\n--- Demo script finished ---") 
