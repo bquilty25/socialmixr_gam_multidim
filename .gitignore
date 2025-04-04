@@ -14,4 +14,4 @@ revdep/
 .Rprofile
 
 # Generated output
-output/
+# output/ # Keep commented out to include plots
