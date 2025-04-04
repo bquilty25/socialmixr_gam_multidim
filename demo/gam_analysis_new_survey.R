@@ -8,6 +8,7 @@ library(mgcv)
 library(data.table)
 library(ggplot2)
 library(patchwork)
+library(dplyr)
 
 # --- Load and Prepare Data ---
 message("Loading survey data...")
@@ -19,13 +20,58 @@ message("Loading survey data...")
 # Example:
 # new_survey_data <- readRDS("path/to/your/survey_data.rds")
 # Or load from other formats and convert using survey()
-new_survey_data <- readRDS('data/connect_survey.rds')
+survey_raw <- readRDS('data/connect_survey.rds')
 
-# Check if data is loaded
-# if (is.null(new_survey_data) || !inherits(new_survey_data, "contact_survey")) {
-#   stop("Failed to load survey data or data is not a contact_survey object. Please check the loading step.")
-# }
-message("Survey data loaded.")
+# Manually set the class to the expected 'contact_survey'
+message("Assigning 'contact_survey' class...")
+class(survey_raw) <- c("contact_survey", class(survey_raw))
+# Ensure 'list' is also included if it's a list structure
+if (is.list(survey_raw) && !"list" %in% class(survey_raw)) {
+  class(survey_raw) <- c("contact_survey", "list") # Or adjust based on actual base type
+}
+
+new_survey_data <- survey_raw # Rename for consistency
+
+# --- Filter out 'Prefer not to say' Ethnicity ---
+message("Filtering out 'Prefer not to say' ethnicity...")
+part_filter_level <- "Prefer not to say"
+cnt_filter_level <- "Prefer not to say"
+
+# Filter participants
+initial_part_rows <- nrow(new_survey_data$participants)
+new_survey_data$participants <- new_survey_data$participants[part_ethnicity != part_filter_level]
+filtered_part_rows <- nrow(new_survey_data$participants)
+message(paste("-> Removed", initial_part_rows - filtered_part_rows, "participants with ethnicity '", part_filter_level, "'."))
+
+# Filter contacts
+initial_cnt_rows <- nrow(new_survey_data$contacts)
+new_survey_data$contacts <- new_survey_data$contacts[cnt_ethnicity != cnt_filter_level]
+filtered_cnt_rows <- nrow(new_survey_data$contacts)
+message(paste("-> Removed", initial_cnt_rows - filtered_cnt_rows, "contacts with ethnicity '", cnt_filter_level, "'."))
+
+# Ensure consistency: Remove contacts whose participant was filtered out
+part_ids_remaining <- unique(new_survey_data$participants$part_id)
+contacts_before_consistency <- nrow(new_survey_data$contacts)
+new_survey_data$contacts <- new_survey_data$contacts[part_id %in% part_ids_remaining]
+contacts_after_consistency <- nrow(new_survey_data$contacts)
+if(contacts_after_consistency < contacts_before_consistency) {
+    message(paste("-> Removed", contacts_before_consistency - contacts_after_consistency, "contacts due to participant filtering."))
+}
+
+# Ensure consistency: Remove participants with no contacts left
+contact_ids_remaining <- unique(new_survey_data$contacts$part_id)
+participants_before_consistency <- nrow(new_survey_data$participants)
+new_survey_data$participants <- new_survey_data$participants[part_id %in% contact_ids_remaining]
+participants_after_consistency <- nrow(new_survey_data$participants)
+if(participants_after_consistency < participants_before_consistency) {
+    message(paste("-> Removed", participants_before_consistency - participants_after_consistency, "participants with no remaining contacts after filtering."))
+}
+message("Filtering complete.")
+
+levels(new_survey_data$participants$part_ethnicity)
+levels(new_survey_data$contacts$cnt_ethnicity)
+
+message("Survey data loaded and class assigned.")
 
 # Ensure the gam_contact_matrix function is available
 # Assumes the R script is in the workspace root
@@ -41,7 +87,7 @@ analysis_age_limits <- c(0, 80) # e.g., 0 to 80 years
 # GAM settings (can be customized)
 gam_family_setting <- nb() # Negative Binomial often suitable
 k_tensor_setting <- c(8, 8)
-k_by_setting <- 6
+k_by_setting <- 6 # Restore default (won't be used by auto-formula now)
 bs_numeric_setting <- "ps"
 
 # --- Analysis 1: Age x Ethnicity ---
@@ -50,18 +96,26 @@ message("\n--- Starting Analysis 1: Age x Ethnicity ---")
 # Define dimensions for Age x Ethnicity
 dimensions_age_eth <- c("part_age", "cnt_age", "part_ethnicity", "cnt_ethnicity")
 
+# Get actual ethnicity levels from the *filtered* data
+part_eth_levels <- levels(droplevels(new_survey_data$participants$part_ethnicity))
+cnt_eth_levels <- levels(droplevels(new_survey_data$contacts$cnt_ethnicity))
+message("Using filtered ethnicity levels for breaks:")
+message(" Part levels: ", paste(part_eth_levels, collapse=", "))
+message(" Cont levels: ", paste(cnt_eth_levels, collapse=", "))
+
 # !!! USER ACTION REQUIRED !!!
 # Define breaks for Age x Ethnicity
 # Adjust age breaks and ethnicity levels as needed for your data
 dim_breaks_age_eth <- list(
   part_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
   cnt_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
-  part_ethnicity = c('White','Asian','Black','Mixed','Other'), # Replace with actual factor levels
-  cnt_ethnicity = c('White','Asian','Black','Mixed','Other')  # Replace with actual factor levels
+  part_ethnicity = part_eth_levels,
+  cnt_ethnicity = cnt_eth_levels
 )
 
 # Run gam_contact_matrix for Age x Ethnicity
 gam_results_age_eth <- tryCatch({
+  # Return value is now the full list again
   gam_contact_matrix(
     survey = new_survey_data,
     countries = target_country, # Use NULL if country filtering not needed
@@ -70,23 +124,25 @@ gam_results_age_eth <- tryCatch({
     family = gam_family_setting,
     age_limits = analysis_age_limits,
     k_tensor = k_tensor_setting,
-    k_by = k_by_setting,
-    bs_numeric = bs_numeric_setting
+    # k_by = k_by_setting, # Not used by simplified auto-formula
+    bs_numeric = bs_numeric_setting,
+    use_bam = TRUE # Explicitly use bam for ethnicity
   )
 }, error = function(e) {
   message("Error running gam_contact_matrix for Age x Ethnicity: ", e$message)
   return(NULL)
 })
 
-# --- Process and Visualize Age x Ethnicity Results ---
+# --- Process and Visualize Age x Ethnicity Results --- # UNCOMMENTED
 if (!is.null(gam_results_age_eth)) {
   message("Age x Ethnicity GAM analysis complete. Processing results...")
 
   # Extract matrix and prediction grid
-  predicted_matrix_age_eth <- gam_results_age_eth$matrix
-  plot_data_age_eth <- gam_results_age_eth$prediction_grid
+  predicted_matrix_age_eth <- gam_results_age_eth$matrix # Now available
+  plot_data_age_eth <- gam_results_age_eth$prediction_grid # Now available
   plot_data_age_eth$predicted_contacts <- as.vector(predicted_matrix_age_eth)
   setDT(plot_data_age_eth)
+  message("-> Results extracted.")
 
   cat("\nDimensions of the Age x Ethnicity predicted matrix:\n")
   print(dim(predicted_matrix_age_eth))
@@ -95,27 +151,31 @@ if (!is.null(gam_results_age_eth)) {
   # Generate age labels from breaks for plotting
   age_labels_part <- paste0("[", dim_breaks_age_eth$part_age[-length(dim_breaks_age_eth$part_age)], ",", dim_breaks_age_eth$part_age[-1], ")")
   age_labels_cnt <- paste0("[", dim_breaks_age_eth$cnt_age[-length(dim_breaks_age_eth$cnt_age)], ",", dim_breaks_age_eth$cnt_age[-1], ")")
+  message("-> Age labels generated.")
 
   # Factorise age groups for plotting
   # Note: This assumes regular 5-year bands based on seq(..., 5)
   plot_data_age_eth[, part_age_group := factor(paste0("[", findInterval(part_age, dim_breaks_age_eth$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dim_breaks_age_eth$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
   plot_data_age_eth[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dim_breaks_age_eth$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dim_breaks_age_eth$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+  message("-> Age groups factorised.")
 
-  # --- Visualization (Example: Facet wrap by ethnicity pair) ---
+  # --- Visualization (Example: Facet wrap by ethnicity pair) --- 
   message("\nCreating Age x Ethnicity visualisations...")
   # Ensure factor levels match dim_breaks for faceting labels
   eth_levels <- dim_breaks_age_eth$part_ethnicity
   plot_data_age_eth[, part_ethnicity := factor(part_ethnicity, levels = eth_levels)]
   plot_data_age_eth[, cnt_ethnicity := factor(cnt_ethnicity, levels = eth_levels)]
 
+  message("-> Creating p_age_eth plot object...")
   p_age_eth <- ggplot(plot_data_age_eth, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts") +
-    facet_grid(cnt_ethnicity ~ part_ethnicity, labeller = label_both) +
+    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts", 
+                         na.value = "grey80", trans = scales::log10_trans()) + # Use log10 trans
+    facet_grid(cnt_ethnicity ~ part_ethnicity, labeller = labeller(.default = label_both, .multi_line = TRUE)) +
     labs(
       title = "Predicted Contacts: Age x Ethnicity",
       subtitle = paste(ifelse(!is.null(target_country), paste("Country:", target_country), "All Countries"),
-                     "| Model: GAM (Age-Age Tensor + Eth Interactions + Age-Eth Smooths)"),
+                     "| Model: BAM (Age-Age Tensor + Eth Interaction)"), # Simplified model name
       x = "Participant Age Group",
       y = "Contact Age Group"
     ) +
@@ -128,29 +188,36 @@ if (!is.null(gam_results_age_eth)) {
       plot.subtitle = element_text(size = 10),
       strip.text = element_text(size = 8, face = "bold")
     )
+  message("-> p_age_eth plot object created.")
 
-  # --- Save Age x Ethnicity Outputs ---
+  # --- Save Age x Ethnicity Outputs --- 
   output_dir_age_eth <- "output/gam_analysis/age_ethnicity"
   dir.create(output_dir_age_eth, recursive = TRUE, showWarnings = FALSE)
   
-  plot_data_age_eth <- arrange(plot_data_age_eth, part_age, cnt_age)
-  plot_data_age_eth$part_age_group <- factor(plot_data_age_eth$part_age_group, levels = rev(unique(plot_data_age_eth$part_age_group)))
-  plot_data_age_eth$cnt_age_group <- factor(plot_data_age_eth$cnt_age_group, levels = unique(plot_data_age_eth$cnt_age_group))
+  message("-> Preparing data for flattened_matrix...")
+  plot_data_age_eth_flat <- copy(plot_data_age_eth)
+  plot_data_age_eth_flat <- arrange(plot_data_age_eth_flat, part_age, cnt_age)
+  # Ensure factor levels are ordered correctly for faceting
+  plot_data_age_eth_flat$part_age_group <- factor(plot_data_age_eth_flat$part_age_group, levels = age_labels_part) 
+  plot_data_age_eth_flat$cnt_age_group <- factor(plot_data_age_eth_flat$cnt_age_group, levels = age_labels_cnt)
+  # Reverse the factor levels for contact age group to flip facet order
+  plot_data_age_eth_flat$cnt_age_group <- factor(plot_data_age_eth_flat$cnt_age_group, levels = rev(age_labels_cnt))
   
-  flattened_matrix <- ggplot(plot_data_age_eth, 
+  message("-> Creating flattened_matrix plot object...")
+  p_age_eth_flattened <- ggplot(plot_data_age_eth_flat, # Rename plot object
                              aes(x = part_ethnicity, y = cnt_ethnicity, fill = predicted_contacts)) + 
     geom_tile(colour = "white", linewidth = 0.1) +
     scale_fill_viridis_c(option = "plasma", name = "Mean contacts", 
-                         limits = c(0, max(plot_data$predicted_contacts, na.rm = TRUE)),
-                         trans = scales::pseudo_log_trans(sigma = 2), breaks = c(0,1,2,3,4,5,6)) +
+                         na.value="grey80", trans = scales::log10_trans()) + # Use log10 trans
     labs(
       title = sprintf("Mean Contacts: Age Group x Ethnicity"),
-      subtitle = paste("Model: GAM (Tensor Spline + Ethnicity Interaction)"),
-      x = "Participant",
-      y = "Contact"
+      subtitle = paste("Model: BAM (Tensor Spline + Ethnicity Interaction)"),
+      x = "Participant Ethnicity",
+      y = "Contact Ethnicity"
     ) +
     theme_minimal(base_size = 10) +
-    facet_grid(part_age_group ~ cnt_age_group, switch = 'both') + 
+    facet_grid(cnt_age_group ~ part_age_group, switch = 'both', 
+               labeller = labeller(.multi_line = TRUE)) + # Allow multiline facet labels
     theme(
       axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size=7),
       axis.text.y = element_text(size=7),
@@ -161,122 +228,95 @@ if (!is.null(gam_results_age_eth)) {
       strip.background = element_blank(),
       strip.placement = "outside"
     )
-  ggsave(paste0(output_dir_age_eth/, "flattened_matrix.png"), plot = flattened_matrix, width = 12, height = 10, dpi = 600, bg="white")
+  message("-> p_age_eth_flattened plot object created.") # Update message
+
+  message("-> Saving p_age_eth_flattened plot...") # Update message
+  # Consistent filename for the flattened plot
+  plot_filename_flat_age_eth <- file.path(output_dir_age_eth, paste0("gam_contact_matrix_age_ethnicity_flattened", ifelse(!is.null(target_country), paste0("_", target_country), ""), ".png"))
+  ggsave(plot_filename_flat_age_eth, plot = p_age_eth_flattened, width = 12, height = 10, dpi = 600, bg="white")
+  # Also save as PDF for consistency with other main plots
+  plot_filename_flat_age_eth_pdf <- sub(".png$", ".pdf", plot_filename_flat_age_eth)
+  ggsave(plot_filename_flat_age_eth_pdf, plot = p_age_eth_flattened, width = 12, height = 10, dpi = 600, bg="white")
+  message(paste("-> Flattened Age x Ethnicity plot saved to:", plot_filename_flat_age_eth, "and .pdf")) # Update message
 
   plot_filename_base_age_eth <- file.path(output_dir_age_eth, paste0("gam_contact_matrix_age_ethnicity", ifelse(!is.null(target_country), paste0("_", target_country), "")))
+  message("-> Saving p_age_eth plots...")
   ggsave(paste0(plot_filename_base_age_eth, ".png"), plot = p_age_eth, width = 10, height = 8, dpi = 600, bg = "white")
   ggsave(paste0(plot_filename_base_age_eth, ".pdf"), plot = p_age_eth, width = 10, height = 8, dpi = 600, bg = "white")
-  message(paste("Age x Ethnicity plot saved to:", paste0(plot_filename_base_age_eth, ".png/.pdf")))
+  message(paste("-> Age x Ethnicity plot saved to:", paste0(plot_filename_base_age_eth, ".png/.pdf")))
 
   rds_filename_age_eth <- file.path(output_dir_age_eth, paste0("gam_results_age_ethnicity", ifelse(!is.null(target_country), paste0("_", target_country), ""), ".rds"))
-  saveRDS(gam_results_age_eth, file = rds_filename_age_eth)
-  message(paste("Age x Ethnicity GAM results object saved to:", rds_filename_age_eth))
+  message("-> Saving RDS object...")
+  saveRDS(gam_results_age_eth, file = rds_filename_age_eth) # Restore saving
+  message(paste("-> Age x Ethnicity GAM results object saved to:", rds_filename_age_eth))
 
-  if (interactive()) print(p_age_eth)
+  # if (interactive()) print(p_age_eth) # Keep commented out for non-interactive run
 
-  # --- Compare Models (Age x Ethnicity) ---
+  #   # --- Compare Models (Age x Ethnicity) --- #
   message("\nComparing GAM models for Age x Ethnicity...")
-  # Re-aggregate data and fit models directly for comparison
+  # Fit a simpler model without the ethnicity interaction for comparison
+  # Note: Requires gam_formula = NULL in gam_contact_matrix to be modified or
+  # a separate function call that omits the interaction term build logic.
+  # FOR NOW: We assume gam_contact_matrix needs to be called again with
+  # appropriate dimensions/formula if we want a true comparison.
+  # Simplified approach: Manually define a simpler formula
+  # (This requires gam_results_age_eth to contain the fitted model `gam_fit`)
 
-  # 1. Prepare data (similar to internal steps of gam_contact_matrix)
-  data_prep_eth <- copy(new_survey_data)
-  # Apply country filter if needed
-  if (!is.null(target_country) && "country" %in% names(data_prep_eth$participants)) {
-    data_prep_eth$participants <- data_prep_eth$participants[country %in% target_country]
-    data_prep_eth$contacts <- data_prep_eth$contacts[part_id %in% data_prep_eth$participants$part_id]
-  }
-  # Ensure age/ethnicity columns exist (basic check, assumes factors/integers)
-  required_dims_eth <- dimensions_age_eth
-  # Apply age limits
-  if (!is.null(analysis_age_limits)) {
-      min_age <- analysis_age_limits[1]
-      max_age <- analysis_age_limits[2]
-      data_prep_eth$participants <- data_prep_eth$participants[part_age >= min_age & part_age <= max_age]
-      data_prep_eth$contacts <- data_prep_eth$contacts[cnt_age >= min_age & cnt_age <= max_age]
-      part_ids_remain <- unique(data_prep_eth$participants$part_id)
-      data_prep_eth$contacts <- data_prep_eth$contacts[part_id %in% part_ids_remain]
-      contact_ids_remain <- unique(data_prep_eth$contacts$part_id)
-      data_prep_eth$participants <- data_prep_eth$participants[part_id %in% contact_ids_remain]
-  }
-  # Merge
-  gam_data_full_direct_eth <- merge(
-      data_prep_eth$contacts,
-      data_prep_eth$participants[, .(part_id, part_age, part_ethnicity)], # Select needed cols
-      by = "part_id"
-  )
-  # Convert factors if needed (should be factors already ideally)
-  gam_data_full_direct_eth[, part_ethnicity := as.factor(part_ethnicity)]
-  gam_data_full_direct_eth[, cnt_ethnicity := as.factor(cnt_ethnicity)]
-  # Aggregate
-  gam_data_agg_direct_eth <- gam_data_full_direct_eth[, .N, by = required_dims_eth]
-  message("Data prepared for direct model fitting (Age x Ethnicity).")
+  # Example: Fit model without the explicit ethnicity interaction term
+  # Get the formula used for the main model (assuming it's stored)
+  main_formula_eth_str <- deparse(gam_results_age_eth$gam_formula)
+  # Attempt to create a simpler formula string (may need refinement)
+  simple_formula_eth_str <- gsub("\\s*\\+\\s*ethnicity_interaction", "", main_formula_eth_str)
 
-  # 2. Define Formulas
-  # Complex formula (matches default gam_contact_matrix behaviour)
-  complex_formula_eth_str <- paste(
-    paste0("N ~ te(part_age, cnt_age, k = c(", k_tensor_setting[1], ", ", k_tensor_setting[2], "), bs = \"", bs_numeric_setting, "\")"),
-    "interaction(part_ethnicity, cnt_ethnicity)",
-    paste0("s(part_age, by = interaction(part_ethnicity, cnt_ethnicity), k = ", k_by_setting, ", bs = \"", bs_numeric_setting, "\")"),
-    paste0("s(cnt_age, by = interaction(part_ethnicity, cnt_ethnicity), k = ", k_by_setting, ", bs = \"", bs_numeric_setting, "\")"),
-    sep = " + "
-  )
-  complex_formula_eth <- as.formula(complex_formula_eth_str)
+  if (simple_formula_eth_str != main_formula_eth_str) {
+    simple_formula_eth <- as.formula(simple_formula_eth_str)
+    message("Fitting simpler Age x Ethnicity model with formula: ", simple_formula_eth_str)
 
-  # Simple formula (no age-by-ethnicity smooths)
-  simple_formula_eth_str <- paste(
-      paste0("N ~ te(part_age, cnt_age, k=c(", k_tensor_setting[1], ",", k_tensor_setting[2], "), bs=\"", bs_numeric_setting, "\")"),
-      "interaction(part_ethnicity, cnt_ethnicity)",
-      sep = " + "
-  )
-  simple_formula_eth <- as.formula(simple_formula_eth_str)
-  message("Complex formula (Age x Eth): ", complex_formula_eth_str)
-  message("Simple formula (Age x Eth):  ", simple_formula_eth_str)
-
-  # 3. Fit Models Directly
-  complex_gam_eth <- tryCatch({
-      mgcv::gam(
-          formula = complex_formula_eth,
-          data = gam_data_agg_direct_eth,
-          family = gam_family_setting,
-          method = "REML"
-      )
-  }, error = function(e) { message("Error fitting complex model (Age x Eth): ", e$message); NULL })
-
-  simple_gam_eth <- tryCatch({
-      mgcv::gam(
+    gam_results_simple_eth <- tryCatch({
+      # Re-run using the simpler formula - ensure data prep is implicitly handled
+      # or pass the aggregated data if gam_contact_matrix doesn't expose it
+      # This assumes gam_contact_matrix can accept a formula override
+      # or we fit directly using bam() on prepared data.
+      # Let's try fitting directly for simplicity here:
+      simpler_model_eth <- mgcv::bam(
           formula = simple_formula_eth,
-          data = gam_data_agg_direct_eth,
+          data = gam_results_age_eth$fitting_data, # Use fitting data returned by function
           family = gam_family_setting,
-          method = "REML"
+          method = "fREML",
+          discrete = TRUE
+          # Add other relevant bam args if needed
       )
-  }, error = function(e) { message("Error fitting simple model (Age x Eth): ", e$message); NULL })
+      message("Simpler model fitted.")
+      list(gam_fit = simpler_model_eth) # Mimic structure
+    }, error = function(e) {
+       message("Error fitting simpler Age x Ethnicity model: ", e$message)
+       return(NULL)
+    })
 
-  # 4. Compare AIC
-  if (!is.null(complex_gam_eth) && !is.null(simple_gam_eth)) {
-      aic_complex_eth <- AIC(complex_gam_eth)
-      aic_simple_eth <- AIC(simple_gam_eth)
-      cat("\n--- AIC Comparison (Age x Ethnicity) ---\n")
-      cat(sprintf("AIC (Complex Age-Eth Interaction Model): %.2f\n", aic_complex_eth))
-      cat(sprintf("AIC (Simple Age-Eth Model):            %.2f\n", aic_simple_eth))
-      if (aic_complex_eth < aic_simple_eth) {
-          cat("The complex model with age-ethnicity interactions provides a better fit based on AIC.\n")
-      } else if (aic_simple_eth < aic_complex_eth) {
-          cat("The simpler model provides a better fit based on AIC.\n")
+    if (!is.null(gam_results_simple_eth)) {
+      # Compare AIC
+      aic_full_eth <- AIC(gam_results_age_eth$gam_fit)
+      aic_simple_eth <- AIC(gam_results_simple_eth$gam_fit)
+      message(paste("AIC (Full Age x Eth Model):", round(aic_full_eth, 2)))
+      message(paste("AIC (Simple Age x Eth Model):", round(aic_simple_eth, 2)))
+      if (aic_full_eth < aic_simple_eth) {
+        message("Full model (with ethnicity interaction) has lower AIC.")
       } else {
-          cat("Both models have similar AIC values.\n")
+        message("Simpler model (without ethnicity interaction) has lower AIC.")
       }
-      # Optional: Add ANOVA comparison
-      # anova_comp_eth <- anova(simple_gam_eth, complex_gam_eth, test = "Chisq")
-      # print(anova_comp_eth)
+    } else {
+       message("Could not fit simpler model for Age x Ethnicity, skipping AIC comparison.")
+    }
   } else {
-      message("Could not fit both models for Age x Ethnicity, skipping AIC comparison.")
+      message("Could not derive simpler formula for Age x Ethnicity, skipping comparison.")
   }
+  # --- End Comparison --- #
 
 } else {
   message("\nAge x Ethnicity GAM analysis failed. No results to process or compare.")
 }
 
-# --- Analysis 2: Age x Socioeconomic Status (SES) ---
+# --- Analysis 2: Age x Socioeconomic Status (SES) --- # UNCOMMENTING
 message("\n--- Starting Analysis 2: Age x SES ---")
 
 # Define dimensions for Age x SES
@@ -288,8 +328,8 @@ dimensions_age_ses <- c("part_age", "cnt_age", "part_ses", "cnt_ses")
 dim_breaks_age_ses <- list(
   part_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
   cnt_age = seq(analysis_age_limits[1], analysis_age_limits[2], 5),
-  part_ses = c("Low", "Medium", "High"), # Replace with actual factor levels
-  cnt_ses = c("Low", "Medium", "High")  # Replace with actual factor levels
+  part_ses = levels(new_survey_data$participants$part_ses),
+  cnt_ses = levels(new_survey_data$contacts$cnt_ses) # Corrected: use contacts data
 )
 
 # Run gam_contact_matrix for Age x SES
@@ -302,15 +342,16 @@ gam_results_age_ses <- tryCatch({
     family = gam_family_setting,
     age_limits = analysis_age_limits,
     k_tensor = k_tensor_setting,
-    k_by = k_by_setting,
-    bs_numeric = bs_numeric_setting
+    # k_by = k_by_setting, # Not used by simplified auto-formula
+    bs_numeric = bs_numeric_setting,
+    use_bam = TRUE # Use bam for SES now
   )
 }, error = function(e) {
   message("Error running gam_contact_matrix for Age x SES: ", e$message)
   return(NULL)
 })
 
-# --- Process and Visualize Age x SES Results ---
+# --- Process and Visualize Age x SES Results --- # ADDING MESSAGES
 if (!is.null(gam_results_age_ses)) {
   message("Age x SES GAM analysis complete. Processing results...")
 
@@ -319,31 +360,36 @@ if (!is.null(gam_results_age_ses)) {
   plot_data_age_ses <- gam_results_age_ses$prediction_grid
   plot_data_age_ses$predicted_contacts <- as.vector(predicted_matrix_age_ses)
   setDT(plot_data_age_ses)
+  message("-> SES Results extracted.")
 
   cat("\nDimensions of the Age x SES predicted matrix:\n")
   print(dim(predicted_matrix_age_ses))
   print(dimnames(predicted_matrix_age_ses))
 
   # Generate age labels (reusing from above if breaks are the same)
+  message("-> SES Age labels reused.")
   # Factorise age groups for plotting (reusing from above if breaks are the same)
   plot_data_age_ses[, part_age_group := factor(paste0("[", findInterval(part_age, dim_breaks_age_ses$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dim_breaks_age_ses$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
   plot_data_age_ses[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dim_breaks_age_ses$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dim_breaks_age_ses$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+  message("-> SES Age groups factorised.")
 
   # --- Visualization (Example: Facet wrap by SES pair) ---
   message("\nCreating Age x SES visualisations...")
   # Ensure factor levels match dim_breaks for faceting labels
   ses_levels <- dim_breaks_age_ses$part_ses
   plot_data_age_ses[, part_ses := factor(part_ses, levels = ses_levels)]
-  plot_data_age_ses[, cnt_ses := factor(cnt_ses, levels = ses_levels)]
+  plot_data_age_ses[, cnt_ses := factor(cnt_ses, levels = dim_breaks_age_ses$cnt_ses)] # Use cnt_ses levels
 
+  message("-> Creating p_age_ses plot object...")
   p_age_ses <- ggplot(plot_data_age_ses, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts") +
-    facet_grid(cnt_ses ~ part_ses, labeller = label_both) +
+    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts", 
+                         na.value = "grey80", trans = scales::log10_trans()) + # Use log10 trans
+    facet_grid(cnt_ses ~ part_ses, labeller = labeller(.default = label_both, .multi_line = TRUE)) +
     labs(
       title = "Predicted Contacts: Age x SES",
       subtitle = paste(ifelse(!is.null(target_country), paste("Country:", target_country), "All Countries"),
-                     "| Model: GAM (Age-Age Tensor + SES Interactions + Age-SES Smooths)"),
+                     "| Model: BAM (Age-Age Tensor + SES Interaction)"), # Updated model name
       x = "Participant Age Group",
       y = "Contact Age Group"
     ) +
@@ -356,119 +402,110 @@ if (!is.null(gam_results_age_ses)) {
       plot.subtitle = element_text(size = 10),
       strip.text = element_text(size = 8, face = "bold")
     )
+  message("-> p_age_ses plot object created.")
 
-  # --- Save Age x SES Outputs ---
+  # --- Save Age x SES Outputs --- 
   output_dir_age_ses <- "output/gam_analysis/age_ses"
   dir.create(output_dir_age_ses, recursive = TRUE, showWarnings = FALSE)
 
+  # --- Create and Save Flattened SES plot ---
+  message("-> Preparing data for flattened SES matrix...")
+  plot_data_age_ses_flat <- copy(plot_data_age_ses)
+  # Ensure factor levels are ordered correctly for faceting
+  plot_data_age_ses_flat$part_age_group <- factor(plot_data_age_ses_flat$part_age_group, levels = age_labels_part)
+  plot_data_age_ses_flat$cnt_age_group <- factor(plot_data_age_ses_flat$cnt_age_group, levels = age_labels_cnt)
+  # Reverse the factor levels for contact age group to flip facet order
+  plot_data_age_ses_flat$cnt_age_group <- factor(plot_data_age_ses_flat$cnt_age_group, levels = rev(age_labels_cnt))
+
+  message("-> Creating p_age_ses_flattened plot object...")
+  p_age_ses_flattened <- ggplot(plot_data_age_ses_flat, 
+                                aes(x = part_ses, y = cnt_ses, fill = predicted_contacts)) + 
+    geom_tile(colour = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "plasma", name = "Mean contacts", 
+                         na.value="grey80", trans = scales::log10_trans()) + # Use log10 trans
+    labs(
+      title = sprintf("Mean Contacts: Age Group x SES"),
+      subtitle = paste("Model: BAM (Tensor Spline + SES Interaction)"),
+      x = "Participant SES",
+      y = "Contact SES"
+    ) +
+    theme_minimal(base_size = 10) +
+    facet_grid(cnt_age_group ~ part_age_group, switch = 'both') + 
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size=7),
+      axis.text.y = element_text(size=7),
+      legend.position = "right",
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      panel.spacing = unit(0, "lines"), 
+      strip.background = element_blank(),
+      strip.placement = "outside"
+    )
+  message("-> p_age_ses_flattened plot object created.")
+  
+  message("-> Saving p_age_ses_flattened plot...")
+  plot_filename_flat_age_ses <- file.path(output_dir_age_ses, paste0("gam_contact_matrix_age_ses_flattened", ifelse(!is.null(target_country), paste0("_", target_country), ""), ".png"))
+  ggsave(plot_filename_flat_age_ses, plot = p_age_ses_flattened, width = 12, height = 10, dpi = 600, bg="white")
+  plot_filename_flat_age_ses_pdf <- sub(".png$", ".pdf", plot_filename_flat_age_ses)
+  ggsave(plot_filename_flat_age_ses_pdf, plot = p_age_ses_flattened, width = 12, height = 10, dpi = 600, bg="white")
+  message(paste("-> Flattened Age x SES plot saved to:", plot_filename_flat_age_ses, "and .pdf"))
+  # --------------------------------------
+
   plot_filename_base_age_ses <- file.path(output_dir_age_ses, paste0("gam_contact_matrix_age_ses", ifelse(!is.null(target_country), paste0("_", target_country), "")))
+  message("-> Saving p_age_ses plots...")
   ggsave(paste0(plot_filename_base_age_ses, ".png"), plot = p_age_ses, width = 10, height = 8, dpi = 600, bg = "white")
   ggsave(paste0(plot_filename_base_age_ses, ".pdf"), plot = p_age_ses, width = 10, height = 8, dpi = 600, bg = "white")
-  message(paste("Age x SES plot saved to:", paste0(plot_filename_base_age_ses, ".png/.pdf")))
+  message(paste("-> Age x SES plot saved to:", paste0(plot_filename_base_age_ses, ".png/.pdf")))
 
   rds_filename_age_ses <- file.path(output_dir_age_ses, paste0("gam_results_age_ses", ifelse(!is.null(target_country), paste0("_", target_country), ""), ".rds"))
+  message("-> Saving SES RDS object...")
   saveRDS(gam_results_age_ses, file = rds_filename_age_ses)
-  message(paste("Age x SES GAM results object saved to:", rds_filename_age_ses))
+  message(paste("-> Age x SES GAM results object saved to:", rds_filename_age_ses))
 
-  if (interactive()) print(p_age_ses)
+  # if (interactive()) print(p_age_ses)
 
-  # --- Compare Models (Age x SES) ---
+  #   # --- Compare Models (Age x SES) --- #
   message("\nComparing GAM models for Age x SES...")
-  # Re-aggregate data and fit models directly for comparison
+  # Similar logic as for Ethnicity
+  main_formula_ses_str <- deparse(gam_results_age_ses$gam_formula)
+  simple_formula_ses_str <- gsub("\\s*\\+\\s*ses_interaction", "", main_formula_ses_str)
 
-  # 1. Prepare data (similar to internal steps of gam_contact_matrix)
-  data_prep_ses <- copy(new_survey_data)
-  # Apply country filter if needed
-  if (!is.null(target_country) && "country" %in% names(data_prep_ses$participants)) {
-    data_prep_ses$participants <- data_prep_ses$participants[country %in% target_country]
-    data_prep_ses$contacts <- data_prep_ses$contacts[part_id %in% data_prep_ses$participants$part_id]
-  }
-  # Ensure age/SES columns exist (basic check, assumes factors/integers)
-  required_dims_ses <- dimensions_age_ses
-  # Apply age limits
-  if (!is.null(analysis_age_limits)) {
-      min_age <- analysis_age_limits[1]
-      max_age <- analysis_age_limits[2]
-      data_prep_ses$participants <- data_prep_ses$participants[part_age >= min_age & part_age <= max_age]
-      data_prep_ses$contacts <- data_prep_ses$contacts[cnt_age >= min_age & cnt_age <= max_age]
-      part_ids_remain <- unique(data_prep_ses$participants$part_id)
-      data_prep_ses$contacts <- data_prep_ses$contacts[part_id %in% part_ids_remain]
-      contact_ids_remain <- unique(data_prep_ses$contacts$part_id)
-      data_prep_ses$participants <- data_prep_ses$participants[part_id %in% contact_ids_remain]
-  }
-  # Merge
-  gam_data_full_direct_ses <- merge(
-      data_prep_ses$contacts,
-      data_prep_ses$participants[, .(part_id, part_age, part_ses)], # Select needed cols
-      by = "part_id"
-  )
-  # Convert factors if needed (should be factors already ideally)
-  gam_data_full_direct_ses[, part_ses := as.factor(part_ses)]
-  gam_data_full_direct_ses[, cnt_ses := as.factor(cnt_ses)]
-  # Aggregate
-  gam_data_agg_direct_ses <- gam_data_full_direct_ses[, .N, by = required_dims_ses]
-  message("Data prepared for direct model fitting (Age x SES).")
+  if (simple_formula_ses_str != main_formula_ses_str) {
+      simple_formula_ses <- as.formula(simple_formula_ses_str)
+      message("Fitting simpler Age x SES model with formula: ", simple_formula_ses_str)
 
-  # 2. Define Formulas
-  # Complex formula (matches default gam_contact_matrix behaviour)
-  complex_formula_ses_str <- paste(
-    paste0("N ~ te(part_age, cnt_age, k = c(", k_tensor_setting[1], ", ", k_tensor_setting[2], "), bs = \"", bs_numeric_setting, "\")"),
-    "interaction(part_ses, cnt_ses)",
-    paste0("s(part_age, by = interaction(part_ses, cnt_ses), k = ", k_by_setting, ", bs = \"", bs_numeric_setting, "\")"),
-    paste0("s(cnt_age, by = interaction(part_ses, cnt_ses), k = ", k_by_setting, ", bs = \"", bs_numeric_setting, "\")"),
-    sep = " + "
-  )
-  complex_formula_ses <- as.formula(complex_formula_ses_str)
+      gam_results_simple_ses <- tryCatch({
+          simpler_model_ses <- mgcv::bam(
+              formula = simple_formula_ses,
+              data = gam_results_age_ses$fitting_data, # Use fitting data returned by function
+              family = gam_family_setting,
+              method = "fREML",
+              discrete = TRUE
+          )
+          message("Simpler model fitted.")
+          list(gam_fit = simpler_model_ses)
+      }, error = function(e) {
+          message("Error fitting simpler Age x SES model: ", e$message)
+          return(NULL)
+      })
 
-  # Simple formula (no age-by-SES smooths)
-  simple_formula_ses_str <- paste(
-      paste0("N ~ te(part_age, cnt_age, k=c(", k_tensor_setting[1], ",", k_tensor_setting[2], "), bs=\"", bs_numeric_setting, "\")"),
-      "interaction(part_ses, cnt_ses)",
-      sep = " + "
-  )
-  simple_formula_ses <- as.formula(simple_formula_ses_str)
-  message("Complex formula (Age x SES): ", complex_formula_ses_str)
-  message("Simple formula (Age x SES):  ", simple_formula_ses_str)
-
-  # 3. Fit Models Directly
-  complex_gam_ses <- tryCatch({
-      mgcv::gam(
-          formula = complex_formula_ses,
-          data = gam_data_agg_direct_ses,
-          family = gam_family_setting,
-          method = "REML"
-      )
-  }, error = function(e) { message("Error fitting complex model (Age x SES): ", e$message); NULL })
-
-  simple_gam_ses <- tryCatch({
-      mgcv::gam(
-          formula = simple_formula_ses,
-          data = gam_data_agg_direct_ses,
-          family = gam_family_setting,
-          method = "REML"
-      )
-  }, error = function(e) { message("Error fitting simple model (Age x SES): ", e$message); NULL })
-
-  # 4. Compare AIC
-  if (!is.null(complex_gam_ses) && !is.null(simple_gam_ses)) {
-      aic_complex_ses <- AIC(complex_gam_ses)
-      aic_simple_ses <- AIC(simple_gam_ses)
-      cat("\n--- AIC Comparison (Age x SES) ---\n")
-      cat(sprintf("AIC (Complex Age-SES Interaction Model): %.2f\n", aic_complex_ses))
-      cat(sprintf("AIC (Simple Age-SES Model):            %.2f\n", aic_simple_ses))
-      if (aic_complex_ses < aic_simple_ses) {
-          cat("The complex model with age-SES interactions provides a better fit based on AIC.\n")
-      } else if (aic_simple_ses < aic_complex_ses) {
-          cat("The simpler model provides a better fit based on AIC.\n")
+      if (!is.null(gam_results_simple_ses)) {
+          aic_full_ses <- AIC(gam_results_age_ses$gam_fit)
+          aic_simple_ses <- AIC(gam_results_simple_ses$gam_fit)
+          message(paste("AIC (Full Age x SES Model):", round(aic_full_ses, 2)))
+          message(paste("AIC (Simple Age x SES Model):", round(aic_simple_ses, 2)))
+          if (aic_full_ses < aic_simple_ses) {
+              message("Full model (with SES interaction) has lower AIC.")
+          } else {
+              message("Simpler model (without SES interaction) has lower AIC.")
+          }
       } else {
-          cat("Both models have similar AIC values.\n")
+          message("Could not fit simpler model for Age x SES, skipping AIC comparison.")
       }
-      # Optional: Add ANOVA comparison
-      # anova_comp_ses <- anova(simple_gam_ses, complex_gam_ses, test = "Chisq")
-      # print(anova_comp_ses)
   } else {
-      message("Could not fit both models for Age x SES, skipping AIC comparison.")
+      message("Could not derive simpler formula for Age x SES, skipping comparison.")
   }
+  # --- End Comparison --- #
 
 } else {
   message("\nAge x SES GAM analysis failed. No results to process or compare.")

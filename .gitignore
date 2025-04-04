@@ -6,3 +6,12 @@ inst/doc
 docs/
 surveys/
 revdep/
+
+*.rds
+
+# R Environment
+.Renviron
+.Rprofile
+
+# Generated output
+output/

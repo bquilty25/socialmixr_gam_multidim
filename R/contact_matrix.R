@@ -836,6 +836,7 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
 #' @param filter Optional list to filter survey data before modeling.
 #' @param age_limits Optional vector specifying the minimum and maximum age to consider.
 #'   Participants or contacts outside these limits will be excluded before modeling.
+#' @param use_bam Logical indicating whether to use `bam()` for fitting (default TRUE).
 #' @param ... Additional arguments passed to `mgcv::gam`.
 #'
 #' @return A list containing:
@@ -914,6 +915,7 @@ gam_contact_matrix <- function(survey,
                                bs_numeric = "ps",
                                filter = NULL,
                                age_limits = NULL,
+                               use_bam = TRUE,
                                ...) {
 
   # Check if mgcv is installed
@@ -1112,14 +1114,44 @@ gam_contact_matrix <- function(survey,
 
 
   # Aggregate contacts: Count N contacts for each combination of participant & contact characteristics
-  grouping_vars <- dimensions
-  gam_data_agg <- gam_data_full[, .N, by = c(grouping_vars)]
+  gam_data_agg <- gam_data_full[, .N, by = dimensions]
 
+  # --- Remove rows with NA in any dimension --- # RETAIN THIS STEP
+  rows_before <- nrow(gam_data_agg)
+  gam_data_agg <- na.omit(gam_data_agg, cols = dimensions)
+  rows_after <- nrow(gam_data_agg)
+  if (rows_after < rows_before) {
+      message(paste("Removed", rows_before - rows_after, "rows with NA in dimension columns before fitting."))
+  }
+  # ------------------------------------------
 
-  # --- 2. Build or Use GAM Formula ---
+  # --- Create Explicit Interaction Factors --- # ADDED BACK
+  categorical_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) !is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
+  interaction_col_names <- c()
+  for(sfx in categorical_suffixes) {
+      part_col <- paste0("part_", sfx)
+      cnt_col <- paste0("cnt_", sfx)
+      interaction_col <- paste0(sfx, "_interaction")
+      interaction_col_names <- c(interaction_col_names, interaction_col)
+
+      # Ensure base columns are factors with full levels first
+      full_levels_part <- dim_breaks[[part_col]]
+      full_levels_cnt <- dim_breaks[[cnt_col]]
+      if (!is.factor(gam_data_agg[[part_col]]) || !identical(levels(gam_data_agg[[part_col]]), full_levels_part)){
+          gam_data_agg[, (part_col) := factor(get(part_col), levels = full_levels_part)]
+      }
+       if (!is.factor(gam_data_agg[[cnt_col]]) || !identical(levels(gam_data_agg[[cnt_col]]), full_levels_cnt)){
+          gam_data_agg[, (cnt_col) := factor(get(cnt_col), levels = full_levels_cnt)]
+      }
+
+      message(paste("Creating explicit interaction factor:", interaction_col))
+      gam_data_agg[, (interaction_col) := interaction(get(part_col), get(cnt_col), drop = FALSE)]
+  }
+  # ------------------------------------------
+
+  # --- Build or Use GAM Formula (using explicit interaction factors) ---
   if (is.null(gam_formula)) {
-    # --- Build GAM Formula Automatically (Default: includes interactions) ---
-    message("Building GAM formula automatically (default includes num-cat interactions)...")
+    message("Building GAM formula automatically (using explicit interaction factors)...")
     formula_terms <- c()
 
     # Check argument validity
@@ -1127,57 +1159,47 @@ gam_contact_matrix <- function(survey,
     if(!is.numeric(k_by) || length(k_by) != 1) stop("`k_by` must be a single numeric value.")
 
     numeric_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
-    categorical_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) !is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
+    # Categorical suffixes already identified
 
-    for (suffix in dim_suffixes) {
-        part_var <- paste0("part_", suffix)
-        cnt_var <- paste0("cnt_", suffix)
+    # Handle numeric pairs (Tensor product)
+    for (num_suffix in numeric_suffixes) {
+        part_var <- paste0("part_", num_suffix)
+        cnt_var <- paste0("cnt_", num_suffix)
+        formula_terms <- c(formula_terms,
+                           paste0("te(", part_var, ", ", cnt_var,
+                                  ", k = c(", k_tensor[1], ", ", k_tensor[2], "), bs = \"", bs_numeric, "\")"))
+    }
 
-        # Check data type based on aggregated data
-         is_numeric_part <- is.numeric(gam_data_agg[[part_var]])
-         is_numeric_cnt <- is.numeric(gam_data_agg[[cnt_var]])
-
-         if (is_numeric_part != is_numeric_cnt) {
-              stop(paste("Dimension type mismatch for pair:", suffix, "(", part_var, "and", cnt_var, ")"))
-         }
-
-         if (is_numeric_part) { # Numeric pair (e.g., age)
-             # Tensor product interaction
-             formula_terms <- c(formula_terms,
-                               paste0("te(", part_var, ", ", cnt_var,
-                                      ", k = c(", k_tensor[1], ", ", k_tensor[2], "), bs = \"", bs_numeric, "\")"))
-         } else { # Categorical pair (e.g., gender, ethnicity)
-             formula_terms <- c(formula_terms,
-                               paste0("interaction(", part_var, ", ", cnt_var, ")"))
-         }
+    # Handle categorical pairs (using explicit interaction columns)
+    if (length(interaction_col_names) > 0) {
+         # Add interaction terms as main effects (if multiple, use ':'? Check mgcv advice)
+         formula_terms <- c(formula_terms, paste(interaction_col_names, collapse = " + ")) # Simple addition for now
     }
 
     # Add smooths for numeric variables varying by interactions of categorical variables
-    if (length(numeric_suffixes) > 0 && length(categorical_suffixes) > 0) {
-        # Create interaction term string for all categorical pairs
-        # Needs careful construction if > 1 categorical pair
-        if (length(categorical_suffixes) == 1) {
-             sfx <- categorical_suffixes[1]
-             by_var_str <- paste0("interaction(", paste0("part_", sfx), ", ", paste0("cnt_", sfx), ")")
-        } else {
-            # Create nested interactions: interaction(p_g,c_g):interaction(p_e,c_e) etc.
-             individual_interactions <- sapply(categorical_suffixes, function(sfx) {
-                paste0("interaction(", paste0("part_", sfx), ", ", paste0("cnt_", sfx), ")")
-             })
-             by_var_str <- paste(individual_interactions, collapse = ":")
-        }
-
-        for (num_suffix in numeric_suffixes) {
-            part_num_var <- paste0("part_", num_suffix)
-            cnt_num_var <- paste0("cnt_", num_suffix)
-
-            # Add s(..., by = ...) terms
-            formula_terms <- c(formula_terms,
-                              paste0("s(", part_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
-            formula_terms <- c(formula_terms,
-                              paste0("s(", cnt_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
-        }
-    } else if (length(numeric_suffixes) > 0) {
+    # --- REMOVED s(..., by=...) terms from automatic formula generation ---
+    # if (length(numeric_suffixes) > 0 && length(interaction_col_names) > 0) {
+        # Use the *first* interaction column found for the `by` argument for simplicity
+        # Assumes primary interaction effect is captured by the first categorical pair
+        # More complex scenarios might need adjusted logic or user-provided formula
+        # by_var_str <- interaction_col_names[1]
+        # if (length(interaction_col_names) > 1) {
+        #     warning(paste("Multiple categorical interactions found (", paste(interaction_col_names, collapse=", "),
+        #                 "). Using only the first (", by_var_str, ") for 'by=' terms in automatic formula.",
+        #                 "Consider providing a custom `gam_formula` for more complex structures."))
+        # }
+        # 
+        # for (num_suffix in numeric_suffixes) {
+        #     part_num_var <- paste0("part_", num_suffix)
+        #     cnt_num_var <- paste0("cnt_", num_suffix)
+        #     formula_terms <- c(formula_terms,
+        #                       paste0("s(", part_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+        #     formula_terms <- c(formula_terms,
+        #                       paste0("s(", cnt_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
+        # }
+    # } else if (length(numeric_suffixes) > 0) {
+    # # Add simple smooths ONLY if NO categorical interactions are present
+    if (length(numeric_suffixes) > 0 && length(interaction_col_names) == 0) {
          # If only numeric dimensions, add simple smooths (main effects to complement te())
          for (num_suffix in numeric_suffixes) {
             part_num_var <- paste0("part_", num_suffix)
@@ -1188,6 +1210,7 @@ gam_contact_matrix <- function(survey,
                                paste0("s(", cnt_num_var, ", k = ", k_tensor[2], ", bs = \"", bs_numeric, "\")"))
          }
     }
+    # --------------------------------------------------------------------
 
     # Assemble final formula string
     if (length(formula_terms) == 0) {
@@ -1204,23 +1227,36 @@ gam_contact_matrix <- function(survey,
      }
      message("Using provided GAM formula.")
      formula_to_use <- gam_formula
-     # Set generated formula to NA if formula provided by user
      gam_formula_generated <- NA
   }
 
+  # --- 3. Fit GAM/BAM ---
+  if (use_bam) {
+      message("Fitting model using bam()...")
+      gam_fit <- mgcv::bam(
+          formula = formula_to_use,
+          data = gam_data_agg,
+          family = family,
+          method = "fREML",
+          discrete = TRUE,
+          trace = TRUE,
+          ...
+      )
+      message("BAM fitting complete.")
+  } else {
+      message("Fitting model using gam()...")
+      gam_fit <- mgcv::gam(
+          formula = formula_to_use,
+          data = gam_data_agg,
+          family = family,
+          method = "fREML", # Use fREML for consistency
+          # gam does not use discrete or trace
+          ...
+      )
+      message("GAM fitting complete.")
+  }
 
-  # --- 3. Fit GAM ---
-  message("Fitting GAM model...")
-  gam_fit <- mgcv::gam(
-      formula = formula_to_use, # Use the generated or provided formula
-      data = gam_data_agg,
-      family = family,
-      method = "REML", # Default method, often robust
-      ...             # Pass additional args to gam
-  )
-  message("GAM fitting complete.")
-
-  # --- 4. Create Prediction Grid ---
+  # --- 4. Create Prediction Grid --- 
   prediction_grid_list <- lapply(dimensions, function(dim_name) {
     breaks <- dim_breaks[[dim_name]]
     if (is.numeric(breaks)) {
@@ -1251,29 +1287,46 @@ gam_contact_matrix <- function(survey,
   # Ensure factor levels in prediction grid match those used in model fitting
   prediction_grid <- do.call(expand.grid, c(prediction_grid_list, list(KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)))
 
+  # --- Create Explicit Interaction Factors in Prediction Grid --- # (Keep this step)
+  prediction_grid_dt <- as.data.table(prediction_grid)
+  for(sfx in categorical_suffixes) {
+      part_col <- paste0("part_", sfx)
+      cnt_col <- paste0("cnt_", sfx)
+      interaction_col <- paste0(sfx, "_interaction")
 
-  # --- 5. Predict using GAM ---
+      # Ensure base columns are factors with full levels matching dim_breaks
+      full_levels_part <- dim_breaks[[part_col]]
+      full_levels_cnt <- dim_breaks[[cnt_col]]
+      if (!is.factor(prediction_grid_dt[[part_col]]) || !identical(levels(prediction_grid_dt[[part_col]]), full_levels_part)){
+          prediction_grid_dt[, (part_col) := factor(get(part_col), levels = full_levels_part)]
+      }
+       if (!is.factor(prediction_grid_dt[[cnt_col]]) || !identical(levels(prediction_grid_dt[[cnt_col]]), full_levels_cnt)){
+          prediction_grid_dt[, (cnt_col) := factor(get(cnt_col), levels = full_levels_cnt)]
+      }
+
+      # Create the interaction factor using the same logic (drop=FALSE)
+      prediction_grid_dt[, (interaction_col) := interaction(get(part_col), get(cnt_col), drop = FALSE)]
+  }
+  prediction_grid <- as.data.frame(prediction_grid_dt) # Convert back if needed by predict
+  # -------------------------------------------------------------
+
+  # --- 5. Predict using GAM/BAM --- 
   message("Predicting contact rates on grid...")
-  # Need to handle potential missing factor levels between model data and prediction grid
   predicted_values <- tryCatch({
-        mgcv::predict.gam(
-           gam_fit,
-           newdata = prediction_grid,
-           type = "response", # Get predictions on the scale of the response
-           se.fit = FALSE
-       )
-    }, error = function(e) {
-        # Common error is factor level mismatch
-        if (grepl("factor .* has new levels", e$message)) {
-            stop(paste("Error during prediction: Factor level mismatch.",
-                       "Ensure levels in `dim_breaks` for categorical dimensions",
-                       "exactly match the levels present in the data used for fitting.",
-                       "Original error:", e$message), call. = FALSE)
-        } else {
-            stop(paste("Error during prediction:", e$message), call. = FALSE)
-        }
+      # Use the correct prediction function based on the fitted object class
+      predict_func <- if (inherits(gam_fit, "bam")) mgcv::predict.bam else mgcv::predict.gam
+      predict_func(
+          gam_fit,
+          newdata = prediction_grid,
+          type = "response",
+          se.fit = FALSE
+      )
+  }, error = function(e) {
+     # Error handling remains
+     stop(paste("Error during prediction:", e$message), call. = FALSE)
   })
-   message("Prediction complete.")
+
+  message("Prediction complete.")
 
   # --- 6. Reshape into Matrix/Array ---
   # Determine the dimensions of the output array based on the number of levels/bins
@@ -1303,7 +1356,7 @@ gam_contact_matrix <- function(survey,
       } else {
           # Use factor levels directly
            return(as.character(breaks))
-      }
+       }
   })
   names(array_dimnames) <- dimensions
 
@@ -1317,15 +1370,16 @@ gam_contact_matrix <- function(survey,
       dimnames = array_dimnames
   )
 
-  # --- 7. Return Results ---
+  # --- 7. Return Results --- # Restore original return value
   return(
     list(
       matrix = contact_array,
-      gam_fit = gam_fit,
       prediction_grid = prediction_grid,
       dimensions = dimensions,
       dim_breaks = dim_breaks,
-      gam_formula = gam_formula_generated # Return the generated formula (NA if provided)
+      gam_formula = gam_formula_generated,
+      gam_fit = gam_fit,
+      fitting_data = gam_data_agg
     )
   )
 }
