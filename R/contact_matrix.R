@@ -829,7 +829,7 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
 #' @param k_tensor Numeric vector `c(k1, k2)` specifying the basis dimensions `k` for
 #'   the tensor product smooth `te()` between numeric pairs (e.g., age-age).
 #'   Defaults to `c(8, 8)`.
-#' @param k_by Numeric value specifying the basis dimension `k` for smooth terms
+#' @param k_by_dims Numeric value specifying the basis dimension `k` for smooth terms
 #'   interacting with categorical variables (`s(..., by = ...)`). Defaults to 6.
 #' @param bs_numeric Character string specifying the basis type (e.g., "ps", "cr")
 #'   for all numeric smooth terms (`te` and `s`). Defaults to "ps".
@@ -840,16 +840,20 @@ contact_matrix <- function(survey, countries = NULL, survey.pop, age.limits, fil
 #' @param ... Additional arguments passed to `mgcv::gam`.
 #'
 #' @return A list containing:
-#'   - `matrix`: The predicted contact matrix (as a multidimensional array).
+#'   - `matrix`: The predicted contact **rate** matrix (as a multidimensional array).
 #'   - `gam_fit`: The fitted `gam` object from `mgcv`.
-#'   - `prediction_grid`: The data frame used for prediction.
+#'   - `prediction_grid`: The data frame used for prediction (representing stratum midpoints/levels).
 #'   - `dimensions`: The names of the dimensions.
 #'   - `dim_breaks`: The breaks used for each dimension.
 #'   - `gam_formula`: The `formula` object that was automatically generated (or NA if `gam_formula` was provided).
+#'   - `fitting_data`: The aggregated data frame used to fit the GAM model (includes N contacts and N_participants).
 #'
-#' @importFrom mgcv gam predict.gam
+#' @importFrom mgcv gam predict.gam bam predict.bam s te
 #' @importFrom stats formula reshape aggregate family poisson gaussian nb as.formula
 #' @importFrom graphics image
+#' @importFrom utils data globalVariables
+#' @importFrom data.table copy merge.data.table `:=` setnames setkey data.table .N .SD is.data.table rbindlist as.data.table setkeyv CJ frank
+#' @importFrom countrycode countrycode
 #' @export
 #' @examples
 #' \dontrun{
@@ -910,8 +914,9 @@ gam_contact_matrix <- function(survey,
                                dim_breaks,
                                gam_formula = NULL,
                                family = nb(),
-                               k_tensor = c(8, 8),
-                               k_by = 6,
+                               k_tensor = c(16, 16),
+                               k_by_dims = list(), # Named list: suffix=k_value (e.g., list(ethnicity=6))
+                               k_by_default = 6, # Default k if suffix not in k_by_dims
                                bs_numeric = "ps",
                                filter = NULL,
                                age_limits = NULL,
@@ -940,9 +945,9 @@ gam_contact_matrix <- function(survey,
   # Check pairing
   part_dims <- dimensions[startsWith(dimensions, "part_")]
   cnt_dims <- dimensions[startsWith(dimensions, "cnt_")]
-  if (length(part_dims) != length(cnt_dims) || length(part_dims) != length(dimensions) / 2) {
-      stop("`dimensions` must contain an equal number of 'part_' and 'cnt_' prefixed names.")
-  }
+   if (length(part_dims) != length(cnt_dims) || length(part_dims) != length(dimensions) / 2) {
+       stop("`dimensions` must contain an equal number of 'part_' and 'cnt_' prefixed names.")
+   }
   dim_suffixes <- sub("^part_", "", part_dims)
   if (!all(sub("^cnt_", "", cnt_dims) == dim_suffixes)) {
      stop("`dimensions` must form pairs based on suffixes (e.g., 'part_age'/'cnt_age', 'part_gender'/'cnt_gender').")
@@ -952,56 +957,72 @@ gam_contact_matrix <- function(survey,
   # --- 1. Data Preparation ---
   survey_data <- copy(survey) # Avoid modifying the original object
 
-  # Ensure part_age/cnt_age columns exist
-  # (Adding basic handling for other potential numeric/factor dimensions if needed)
-  for (suffix in dim_suffixes) {
-      part_dim_name <- paste0("part_", suffix)
-      cnt_dim_name <- paste0("cnt_", suffix)
+  # Identify numeric and categorical dimensions based on breaks
+  dim_types <- sapply(dimensions, function(d) {
+      if (is.numeric(dim_breaks[[d]])) "numeric" else "factor"
+  })
 
-      # Participant dimension
-      if (!(part_dim_name %in% names(survey_data$participants))) {
-          exact_col <- paste0(part_dim_name, "_exact")
-          est_min_col <- paste0(part_dim_name, "_est_min")
-          est_max_col <- paste0(part_dim_name, "_est_max")
+  # Helper function to create binned factor columns
+  create_binned_column <- function(data, dim_name, breaks, prefix) {
+      col_name <- paste0(prefix, dim_name)
+      if (!col_name %in% names(data)) {
+           # Try to find source columns (exact, mean of range)
+            exact_col <- paste0(col_name, "_exact")
+            est_min_col <- paste0(col_name, "_est_min")
+            est_max_col <- paste0(col_name, "_est_max")
 
-          if (exact_col %in% names(survey_data$participants)) {
-              survey_data$participants[, (part_dim_name) := survey_data$participants[[exact_col]]]
-          } else if (est_min_col %in% names(survey_data$participants) && est_max_col %in% names(survey_data$participants)) {
-               survey_data$participants[, (part_dim_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
-               message(paste("Note: Created", part_dim_name, "using mean of", est_min_col, "and", est_max_col))
-          } else {
-              stop(paste("Cannot find or create required participant dimension:", part_dim_name))
-          }
-           # Ensure correct type if age
-           if (suffix == "age") {
-               survey_data$participants[, (part_dim_name) := as.integer(get(part_dim_name))]
-           }
+            if (exact_col %in% names(data)) {
+                data[, (col_name) := data[[exact_col]]]
+            } else if (est_min_col %in% names(data) && est_max_col %in% names(data)) {
+                 data[, (col_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
+                 message(paste("Note: Created temporary raw", col_name, "using mean of", est_min_col, "and", est_max_col))
+            } else {
+                stop(paste("Cannot find or create required raw dimension column:", col_name))
+            }
+             # Ensure correct type if age-like
+             if (grepl("age", dim_name, ignore.case = TRUE)) {
+                 data[, (col_name) := as.integer(get(col_name))]
+             }
       }
 
-      # Contact dimension
-      if (!(cnt_dim_name %in% names(survey_data$contacts))) {
-          exact_col <- paste0(cnt_dim_name, "_exact")
-          est_min_col <- paste0(cnt_dim_name, "_est_min")
-          est_max_col <- paste0(cnt_dim_name, "_est_max")
+      binned_col_name <- paste0(col_name, "_binned")
+      raw_values <- data[[col_name]]
 
-          if (exact_col %in% names(survey_data$contacts)) {
-              survey_data$contacts[, (cnt_dim_name) := survey_data$contacts[[exact_col]]]
-          } else if (est_min_col %in% names(survey_data$contacts) && est_max_col %in% names(survey_data$contacts)) {
-               survey_data$contacts[, (cnt_dim_name) := as.integer(rowMeans(.SD, na.rm = TRUE)), .SDcols = c(est_min_col, est_max_col)]
-               message(paste("Note: Created", cnt_dim_name, "using mean of", est_min_col, "and", est_max_col))
-          } else {
-              # If contact dimension is missing, maybe we can infer it? Risky. Stop for now.
-               stop(paste("Cannot find or create required contact dimension:", cnt_dim_name))
-          }
-           # Ensure correct type if age
-           if (suffix == "age") {
-               survey_data$contacts[, (cnt_dim_name) := as.integer(get(cnt_dim_name))]
-           }
+      if (is.numeric(breaks)) {
+         if(length(breaks) < 2) stop(paste("Numeric dimension", col_name, "needs at least 2 breaks."))
+         # Format intervals like contact_matrix
+         lower <- breaks[-length(breaks)]
+         upper <- breaks[-1]
+         labels <- paste0("[", format(lower, trim=TRUE), ",", format(upper, trim=TRUE), ")")
+         data[, (binned_col_name) := cut(raw_values, breaks = breaks, labels = labels, right = FALSE, include.lowest = TRUE)]
+         return(labels) # Return levels
+      } else {
+         # Use levels directly for factors/characters
+         levels_provided <- as.character(breaks)
+         data[, (binned_col_name) := factor(raw_values, levels = levels_provided)]
+          return(levels_provided) # Return levels
       }
   }
 
+  # Apply binning/factoring and store levels
+  all_levels <- list()
+  for (dim_name in dimensions) {
+      breaks <- dim_breaks[[dim_name]]
+      prefix <- if (startsWith(dim_name, "part_")) "part_" else "cnt_"
+      table_name <- if (startsWith(dim_name, "part_")) "participants" else "contacts"
+      # Ensure the base column exists before binning
+      raw_col_name <- dim_name # The original name like 'part_age'
 
-  # Filter by country if specified
+       # Bin the data
+      created_levels <- create_binned_column(survey_data[[table_name]], sub(prefix, "", dim_name), breaks, prefix)
+      all_levels[[paste0(dim_name, "_binned")]] <- created_levels
+  }
+  binned_dimensions <- paste0(dimensions, "_binned")
+  binned_part_dims <- binned_dimensions[startsWith(binned_dimensions, "part_")]
+  binned_cnt_dims <- binned_dimensions[startsWith(binned_dimensions, "cnt_")]
+
+
+  # Filter by country if specified (on original columns)
   if (!is.null(countries) && "country" %in% names(survey_data$participants)) {
       # Use countrycode logic similar to contact_matrix if needed
       if (all(nchar(countries) == 2)) {
@@ -1026,29 +1047,33 @@ gam_contact_matrix <- function(survey,
       survey_data$contacts <- survey_data$contacts[part_id %in% survey_data$participants$part_id]
   }
 
-  # Apply filters if provided (simplified version)
+  # Apply filters if provided (on original or binned columns if filter refers to bins)
   if (!is.null(filter)) {
       for (col in names(filter)) {
-        if (col %in% names(survey_data$participants)) {
-          survey_data$participants <- survey_data$participants[get(col) == filter[[col]]]
+        target_col <- col # Assume original column name
+        if (paste0(col, "_binned") %in% binned_dimensions) {
+            target_col <- paste0(col, "_binned") # Use binned if filter refers to it
+             message(paste("Applying filter on binned column:", target_col))
         }
-         if (col %in% names(survey_data$contacts)) {
-           survey_data$contacts <- survey_data$contacts[get(col) == filter[[col]]]
+        if (target_col %in% names(survey_data$participants)) {
+          survey_data$participants <- survey_data$participants[get(target_col) == filter[[col]]]
+        }
+         if (target_col %in% names(survey_data$contacts)) {
+           survey_data$contacts <- survey_data$contacts[get(target_col) == filter[[col]]]
          }
       }
       # Ensure consistency after filtering
-      survey_data$participants <- survey_data$participants[part_id %in% survey_data$contacts$part_id]
-      survey_data$contacts <- survey_data$contacts[part_id %in% survey_data$participants$part_id]
+       part_ids_remain_filter <- unique(survey_data$participants$part_id)
+       survey_data$contacts <- survey_data$contacts[part_id %in% part_ids_remain_filter]
+       contact_ids_remain_filter <- unique(survey_data$contacts$part_id)
+       survey_data$participants <- survey_data$participants[part_id %in% contact_ids_remain_filter]
        if (nrow(survey_data$participants) == 0 || nrow(survey_data$contacts) == 0) {
         stop("No data left after applying filters.")
       }
   }
 
-   # Ensure required dimension columns exist (already checked implicitly above)
-   required_participant_cols <- dimensions[grepl("^part_", dimensions)]
-   required_contact_cols <- dimensions[grepl("^cnt_", dimensions)]
 
-   # Handle age limits - must happen *after* age columns are created
+   # Handle age limits (apply to *binned* age columns now)
    if (!is.null(age_limits)) {
        if (!is.numeric(age_limits) || length(age_limits) != 2 || age_limits[1] >= age_limits[2]) {
            stop("`age_limits` must be a numeric vector of length 2 specifying min and max age.")
@@ -1056,23 +1081,42 @@ gam_contact_matrix <- function(survey,
        min_age <- age_limits[1]
        max_age <- age_limits[2]
 
-       # Filter participants if part_age exists
-       if ("part_age" %in% names(survey_data$participants)) {
-           survey_data$participants <- survey_data$participants[part_age >= min_age & part_age <= max_age]
-       } else if ("part_age" %in% dimensions) {
-           warning("age_limits provided but 'part_age' column not found after data preparation.")
+        # Find corresponding binned levels to keep (more robust than filtering raw values now)
+        get_levels_within_range <- function(binned_levels, min_val, max_val) {
+            pattern <- "\\[([0-9\\.]+),([0-9\\.]+)\\)"
+            lower_bounds <- as.numeric(sub(pattern, "\\1", binned_levels))
+            upper_bounds <- as.numeric(sub(pattern, "\\2", binned_levels))
+             # Keep levels that *overlap* with the desired range
+             # Level starts before max AND level ends after min
+             keep <- lower_bounds < max_val & upper_bounds > min_val
+            return(binned_levels[keep])
+        }
+
+       # Filter participants based on binned age
+       part_age_binned_col <- grep("^part_.*age.*_binned$", binned_dimensions, value = TRUE)
+       if (length(part_age_binned_col) == 1) {
+           levels_to_keep <- get_levels_within_range(all_levels[[part_age_binned_col]], min_age, max_age)
+           survey_data$participants <- survey_data$participants[get(part_age_binned_col) %in% levels_to_keep]
+           message(paste("Filtering participants on age levels:", paste(levels_to_keep, collapse=", ")))
+       } else if ("part_age" %in% dimensions) { # Check original dim name
+           warning("age_limits provided but 'part_age_binned' column not found or ambiguous.")
        }
-       # Filter contacts if cnt_age exists
-        if ("cnt_age" %in% names(survey_data$contacts)) {
-           survey_data$contacts <- survey_data$contacts[cnt_age >= min_age & cnt_age <= max_age]
-       } else if ("cnt_age" %in% dimensions) {
-            warning("age_limits provided but 'cnt_age' column not found after data preparation.")
+
+       # Filter contacts based on binned age
+       cnt_age_binned_col <- grep("^cnt_.*age.*_binned$", binned_dimensions, value = TRUE)
+       if (length(cnt_age_binned_col) == 1) {
+            levels_to_keep <- get_levels_within_range(all_levels[[cnt_age_binned_col]], min_age, max_age)
+            survey_data$contacts <- survey_data$contacts[get(cnt_age_binned_col) %in% levels_to_keep]
+            message(paste("Filtering contacts on age levels:", paste(levels_to_keep, collapse=", ")))
+       } else if ("cnt_age" %in% dimensions) { # Check original dim name
+            warning("age_limits provided but 'cnt_age_binned' column not found or ambiguous.")
        }
-        # Ensure consistency after filtering
-       part_ids_remain <- unique(survey_data$participants$part_id)
-       survey_data$contacts <- survey_data$contacts[part_id %in% part_ids_remain]
-       contact_ids_remain <- unique(survey_data$contacts$part_id)
-       survey_data$participants <- survey_data$participants[part_id %in% contact_ids_remain]
+
+       # Ensure consistency after age filtering
+       part_ids_remain_age <- unique(survey_data$participants$part_id)
+       survey_data$contacts <- survey_data$contacts[part_id %in% part_ids_remain_age]
+       contact_ids_remain_age <- unique(survey_data$contacts$part_id)
+       survey_data$participants <- survey_data$participants[part_id %in% contact_ids_remain_age]
 
         if (nrow(survey_data$participants) == 0 || nrow(survey_data$contacts) == 0) {
            stop("No data left after applying age limits.")
@@ -1080,143 +1124,270 @@ gam_contact_matrix <- function(survey,
    }
 
 
-  # Merge participant dimensions onto contacts data
-  part_dims_to_merge <- intersect(required_participant_cols, names(survey_data$participants))
-  if (length(part_dims_to_merge) > 0) {
-      # Ensure part_id exists for merging
+  # Merge participant *binned* dimensions onto contacts data
+  part_dims_to_merge_binned <- intersect(binned_part_dims, names(survey_data$participants))
+  if (length(part_dims_to_merge_binned) > 0) {
        if (!"part_id" %in% names(survey_data$participants) || !"part_id" %in% names(survey_data$contacts)) {
            stop("Missing 'part_id' column, required for merging participant data.")
        }
-      merge_cols <- unique(c("part_id", part_dims_to_merge)) # Ensure part_id is included and unique
+      merge_cols <- unique(c("part_id", part_dims_to_merge_binned))
+      # Select only needed columns from contacts too
+      contact_cols_needed <- unique(c("part_id", binned_cnt_dims))
       gam_data_full <- merge(
-          survey_data$contacts,
-          survey_data$participants[, ..merge_cols], # Use data.table subsetting
-          by = "part_id"
+          survey_data$contacts[, ..contact_cols_needed],
+          survey_data$participants[, ..merge_cols],
+          by = "part_id",
+          all.x = TRUE # Keep all contacts, even if participant was filtered somehow (shouldn't happen now)
       )
   } else {
-      gam_data_full <- survey_data$contacts
+      # Should not happen if there are participant dimensions
+      gam_data_full <- survey_data$contacts[, ..binned_cnt_dims] # Select only binned contact dims
+      warning("No participant dimensions found to merge.")
   }
 
-  # Check if all dimensions are now in the merged data
-   missing_dims_in_merged <- setdiff(dimensions, names(gam_data_full))
-   if (length(missing_dims_in_merged) > 0) {
-       stop(paste("Internal error: After merging, the following dimensions are missing:",
-                 paste(missing_dims_in_merged, collapse=", ")))
-   }
-
-   # Convert character dimensions to factors for GAM compatibility if needed
-   for(dim_name in dimensions) {
-       if(is.character(gam_data_full[[dim_name]])) {
-           message(paste("Converting character dimension", dim_name, "to factor."))
-           gam_data_full[, (dim_name) := as.factor(get(dim_name))]
-       }
-   }
-
-
-  # Aggregate contacts: Count N contacts for each combination of participant & contact characteristics
-  gam_data_agg <- gam_data_full[, .N, by = dimensions]
-
-  # --- Remove rows with NA in any dimension --- # RETAIN THIS STEP
-  rows_before <- nrow(gam_data_agg)
-  gam_data_agg <- na.omit(gam_data_agg, cols = dimensions)
-  rows_after <- nrow(gam_data_agg)
-  if (rows_after < rows_before) {
-      message(paste("Removed", rows_before - rows_after, "rows with NA in dimension columns before fitting."))
+  # --- Remove rows with NA in any *binned* dimension ---
+  rows_before_na <- nrow(gam_data_full)
+  gam_data_full <- na.omit(gam_data_full, cols = binned_dimensions)
+  rows_after_na <- nrow(gam_data_full)
+  if (rows_after_na < rows_before_na) {
+      message(paste("Removed", rows_before_na - rows_after_na, "contact rows with NA in binned dimension columns."))
   }
-  # ------------------------------------------
 
-  # --- Create Explicit Interaction Factors --- # ADDED BACK
-  categorical_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) !is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
+
+  # --- 2. Aggregate Data & Include Zeros ---
+
+  # Create the complete grid of all possible strata based on levels
+  # Use CJ for data.table cross join
+  all_strata <- do.call(CJ, all_levels)
+  setnames(all_strata, names(all_levels)) # Ensure names match binned_dimensions
+
+  # Aggregate OBSERVED contacts by binned dimensions
+  if (nrow(gam_data_full) > 0) {
+      observed_counts <- gam_data_full[, .N, by = c(binned_dimensions)]
+  } else {
+      # Handle case with zero contacts after filtering
+      observed_counts <- data.table()
+      # Add columns specified in binned_dimensions if empty
+      for (col in binned_dimensions) set(observed_counts, j = col, value = factor(levels = all_levels[[col]] ))
+      observed_counts[, N := integer(0)] # Add N column
+  }
+
+
+  # Aggregate PARTICIPANTS by binned *participant* dimensions
+  # Need to ensure participants table has the binned columns correctly
+  if (nrow(survey_data$participants) > 0) {
+      # Check if all required binned participant columns exist
+      missing_binned_part <- setdiff(binned_part_dims, names(survey_data$participants))
+      if(length(missing_binned_part) > 0) {
+          stop("Internal Error: Binned participant columns missing before aggregation: ", paste(missing_binned_part, collapse=", "))
+      }
+      participant_counts <- survey_data$participants[, .(N_participants = .N), by = c(binned_part_dims)]
+  } else {
+       participant_counts <- data.table()
+       for (col in binned_part_dims) set(participant_counts, j = col, value = factor(levels = all_levels[[col]] ))
+       participant_counts[, N_participants := integer(0)] # Add N_participants column
+  }
+
+
+  # Combine: Start with all strata, add observed counts (N), add participant counts (N_participants)
+  gam_data_for_fitting <- merge(all_strata, observed_counts, by = binned_dimensions, all.x = TRUE)
+  gam_data_for_fitting[is.na(N), N := 0L] # Replace NA counts with 0
+
+  if (length(binned_part_dims) > 0) {
+      gam_data_for_fitting <- merge(gam_data_for_fitting, participant_counts, by = binned_part_dims, all.x = TRUE)
+      gam_data_for_fitting[is.na(N_participants), N_participants := 0L] # Strata with 0 participants
+  } else {
+      # If no participant dimensions, offset is based on total participants? Or should it error?
+      # Let's assume N_participants is the total number of participants if no part dims specified
+       total_participants <- nrow(survey_data$participants)
+       if (total_participants == 0) stop("No participants found, cannot calculate offset.")
+       gam_data_for_fitting[, N_participants := total_participants]
+       warning("No participant dimensions specified; using total number of participants for offset.")
+  }
+
+  # Filter out strata with zero participants (cannot contribute contacts)
+  n_rows_before_filter <- nrow(gam_data_for_fitting)
+  gam_data_for_fitting <- gam_data_for_fitting[N_participants > 0]
+  n_rows_after_filter <- nrow(gam_data_for_fitting)
+  message(paste("Removed", n_rows_before_filter - n_rows_after_filter, "strata with zero participants before fitting."))
+
+  if (nrow(gam_data_for_fitting) == 0) {
+      stop("No data remaining for GAM fitting after removing strata with zero participants.")
+  }
+
+
+  # --- Create Explicit Interaction Factors using *Binned* Categorical Dimensions ---
+  # Find categorical suffixes based on the original dimensions but use binned columns
+  categorical_suffixes <- c()
+  for (sfx in dim_suffixes) {
+      # Check if *both* part_ and cnt_ dimensions for this suffix are factors
+      # (This assumes pairs must be of the same type for interaction, which is reasonable)
+      part_dim_name <- paste0("part_", sfx)
+      cnt_dim_name <- paste0("cnt_", sfx)
+      if (part_dim_name %in% names(dim_types) && cnt_dim_name %in% names(dim_types) &&
+          dim_types[[part_dim_name]] == "factor" && dim_types[[cnt_dim_name]] == "factor") {
+          categorical_suffixes <- c(categorical_suffixes, sfx)
+      }
+  }
+
   interaction_col_names <- c()
-  for(sfx in categorical_suffixes) {
-      part_col <- paste0("part_", sfx)
-      cnt_col <- paste0("cnt_", sfx)
-      interaction_col <- paste0(sfx, "_interaction")
-      interaction_col_names <- c(interaction_col_names, interaction_col)
+  if (length(categorical_suffixes) > 0) {
+      message(paste("Identified categorical suffixes for interaction:", paste(categorical_suffixes, collapse=", ")))
+      for(sfx in categorical_suffixes) {
+          part_col_binned <- paste0("part_", sfx, "_binned")
+          cnt_col_binned <- paste0("cnt_", sfx, "_binned")
+          interaction_col <- paste0(sfx, "_interaction") # Keep original interaction name style
+          interaction_col_names <- c(interaction_col_names, interaction_col)
 
-      # Ensure base columns are factors with full levels first
-      full_levels_part <- dim_breaks[[part_col]]
-      full_levels_cnt <- dim_breaks[[cnt_col]]
-      if (!is.factor(gam_data_agg[[part_col]]) || !identical(levels(gam_data_agg[[part_col]]), full_levels_part)){
-          gam_data_agg[, (part_col) := factor(get(part_col), levels = full_levels_part)]
-      }
-       if (!is.factor(gam_data_agg[[cnt_col]]) || !identical(levels(gam_data_agg[[cnt_col]]), full_levels_cnt)){
-          gam_data_agg[, (cnt_col) := factor(get(cnt_col), levels = full_levels_cnt)]
-      }
+          # Check if binned columns exist before attempting interaction
+          if (!(part_col_binned %in% names(gam_data_for_fitting)) || !(cnt_col_binned %in% names(gam_data_for_fitting))) {
+              stop(paste("Internal Error: Cannot create interaction factor '", interaction_col,
+                         "'. Missing binned columns:", part_col_binned, "or", cnt_col_binned))
+          }
 
-      message(paste("Creating explicit interaction factor:", interaction_col))
-      gam_data_agg[, (interaction_col) := interaction(get(part_col), get(cnt_col), drop = FALSE)]
+          message(paste("Creating explicit interaction factor:", interaction_col, "from binned columns"))
+          gam_data_for_fitting[, (interaction_col) := interaction(get(part_col_binned), get(cnt_col_binned), drop = FALSE, sep = ":")]
+      }
+  } else {
+      message("No categorical dimension pairs found for interaction.")
   }
-  # ------------------------------------------
 
-  # --- Build or Use GAM Formula (using explicit interaction factors) ---
+
+  # --- Build or Use GAM Formula (using binned dimensions and offset) ---
   if (is.null(gam_formula)) {
-    message("Building GAM formula automatically (using explicit interaction factors)...")
+    message("Building GAM formula automatically (using binned dimensions and offset)...")
     formula_terms <- c()
 
     # Check argument validity
     if(!is.numeric(k_tensor) || length(k_tensor) != 2) stop("`k_tensor` must be a numeric vector of length 2.")
-    if(!is.numeric(k_by) || length(k_by) != 1) stop("`k_by` must be a single numeric value.")
+    # Corrected check for k_by_dims: Ensure it's a list
+    if(!is.list(k_by_dims)) stop("`k_by_dims` must be a named list.")
+    # Further checks on names vs suffixes can happen later if needed.
 
-    numeric_suffixes <- dim_suffixes[sapply(dim_suffixes, function(sfx) is.numeric(gam_data_agg[[paste0("part_", sfx)]]))]
-    # Categorical suffixes already identified
+    # Use original dimension names and types for logic, but binned names in formula terms
+    numeric_suffixes <- c()
+    for (sfx in dim_suffixes) {
+        part_dim_name <- paste0("part_", sfx)
+        cnt_dim_name <- paste0("cnt_", sfx)
+        if (part_dim_name %in% names(dim_types) && cnt_dim_name %in% names(dim_types) &&
+            dim_types[[part_dim_name]] == "numeric" && dim_types[[cnt_dim_name]] == "numeric") {
+            numeric_suffixes <- c(numeric_suffixes, sfx)
+        }
+    }
+    if (length(numeric_suffixes) > 0) {
+        message(paste("Identified numeric suffixes for smooths/tensor:", paste(numeric_suffixes, collapse=", ")))
+    } else {
+         message("No numeric dimension pairs found for smooths/tensor.")
+    }
 
-    # Handle numeric pairs (Tensor product)
+    # Convert numeric binned columns back to numeric midpoints for GAM smooths
+    # Create midpoint columns in the fitting data
+    midpoint_cols <- c()
     for (num_suffix in numeric_suffixes) {
-        part_var <- paste0("part_", num_suffix)
-        cnt_var <- paste0("cnt_", num_suffix)
+        for (prefix in c("part_", "cnt_")) {
+            dim_name <- paste0(prefix, num_suffix)
+            binned_col <- paste0(dim_name, "_binned")
+            midpoint_col <- paste0(dim_name, "_midpoint")
+            midpoint_cols <- c(midpoint_cols, midpoint_col)
+
+            breaks <- dim_breaks[[dim_name]]
+            lower <- breaks[-length(breaks)]
+            upper <- breaks[-1]
+            midpoints <- lower + diff(breaks) / 2
+            levels_original <- all_levels[[binned_col]] # Levels generated earlier
+
+             # Create mapping from factor level to midpoint
+             if (length(levels_original) != length(midpoints)) {
+                 stop(paste("Internal Error: Mismatch between levels and midpoints for", binned_col))
+             }
+             level_to_midpoint_map <- setNames(midpoints, levels_original)
+
+            # Apply mapping
+             gam_data_for_fitting[, (midpoint_col) := level_to_midpoint_map[as.character(get(binned_col))]]
+
+             # Check for NAs introduced by mapping (shouldn't happen if levels match)
+              if (anyNA(gam_data_for_fitting[[midpoint_col]])) {
+                  warning(paste("NAs introduced when creating midpoints for", midpoint_col, "- check factor levels."))
+              }
+        }
+    }
+
+
+    # Handle numeric pairs (Tensor product using midpoint columns)
+    for (num_suffix in numeric_suffixes) {
+        part_var_mid <- paste0("part_", num_suffix, "_midpoint")
+        cnt_var_mid <- paste0("cnt_", num_suffix, "_midpoint")
         formula_terms <- c(formula_terms,
-                           paste0("te(", part_var, ", ", cnt_var,
+                           paste0("te(", part_var_mid, ", ", cnt_var_mid,
                                   ", k = c(", k_tensor[1], ", ", k_tensor[2], "), bs = \"", bs_numeric, "\")"))
     }
 
     # Handle categorical pairs (using explicit interaction columns)
     if (length(interaction_col_names) > 0) {
-         # Add interaction terms as main effects (if multiple, use ':'? Check mgcv advice)
-         formula_terms <- c(formula_terms, paste(interaction_col_names, collapse = " + ")) # Simple addition for now
+         formula_terms <- c(formula_terms, paste(interaction_col_names, collapse = " + "))
     }
 
-    # Add smooths for numeric variables varying by interactions of categorical variables
-    # --- REMOVED s(..., by=...) terms from automatic formula generation ---
-    # if (length(numeric_suffixes) > 0 && length(interaction_col_names) > 0) {
-        # Use the *first* interaction column found for the `by` argument for simplicity
-        # Assumes primary interaction effect is captured by the first categorical pair
-        # More complex scenarios might need adjusted logic or user-provided formula
-        # by_var_str <- interaction_col_names[1]
-        # if (length(interaction_col_names) > 1) {
-        #     warning(paste("Multiple categorical interactions found (", paste(interaction_col_names, collapse=", "),
-        #                 "). Using only the first (", by_var_str, ") for 'by=' terms in automatic formula.",
-        #                 "Consider providing a custom `gam_formula` for more complex structures."))
-        # }
-        # 
-        # for (num_suffix in numeric_suffixes) {
-        #     part_num_var <- paste0("part_", num_suffix)
-        #     cnt_num_var <- paste0("cnt_", num_suffix)
-        #     formula_terms <- c(formula_terms,
-        #                       paste0("s(", part_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
-        #     formula_terms <- c(formula_terms,
-        #                       paste0("s(", cnt_num_var, ", by = ", by_var_str, ", k = ", k_by, ", bs = \"", bs_numeric, "\")"))
-        # }
-    # } else if (length(numeric_suffixes) > 0) {
-    # # Add simple smooths ONLY if NO categorical interactions are present
-    if (length(numeric_suffixes) > 0 && length(interaction_col_names) == 0) {
-         # If only numeric dimensions, add simple smooths (main effects to complement te())
-         for (num_suffix in numeric_suffixes) {
-            part_num_var <- paste0("part_", num_suffix)
-            cnt_num_var <- paste0("cnt_", num_suffix)
-             formula_terms <- c(formula_terms,
-                               paste0("s(", part_num_var, ", k = ", k_tensor[1], ", bs = \"", bs_numeric, "\")"))
-             formula_terms <- c(formula_terms,
-                               paste0("s(", cnt_num_var, ", k = ", k_tensor[2], ", bs = \"", bs_numeric, "\")"))
-         }
-    }
-    # --------------------------------------------------------------------
+    # --- Add smooths for numeric midpoint variables --- 
+    # If categorical interactions exist, allow age smooths to vary by category
+    # Otherwise, just add simple age smooths.
+    if (length(numeric_suffixes) > 0) {
+        for (num_suffix in numeric_suffixes) { # Typically just 'age'
+            part_num_var_mid <- paste0("part_", num_suffix, "_midpoint")
+            cnt_num_var_mid <- paste0("cnt_", num_suffix, "_midpoint")
+            
+            if (length(categorical_suffixes) > 0) {
+                # Add smooths varying by the *individual* part/contact category
+                # Assumes a categorical variable exists for each suffix in categorical_suffixes
+                for (cat_suffix in categorical_suffixes) {
+                   # Determine k for this category-specific smooth
+                   k_val_by <- k_by_default # Start with default
+                   if (cat_suffix %in% names(k_by_dims)) {
+                       k_val_by <- k_by_dims[[cat_suffix]]
+                       if (!is.numeric(k_val_by) || length(k_val_by) != 1 || k_val_by < 3) {
+                           warning(paste("Invalid k value specified in k_by_dims for suffix:", cat_suffix, "- using default k=", k_by_default))
+                           k_val_by <- k_by_default
+                       }
+                   } else {
+                        message(paste("Suffix:", cat_suffix, "not found in k_by_dims. Using default k=", k_by_default))
+                   }
 
-    # Assemble final formula string
+                   part_cat_var_binned <- paste0("part_", cat_suffix, "_binned")
+                   cnt_cat_var_binned <- paste0("cnt_", cat_suffix, "_binned")
+
+                   # Check if these factor columns exist before adding terms
+                   if (part_cat_var_binned %in% names(gam_data_for_fitting)) {
+                       formula_terms <- c(formula_terms,
+                                         paste0("s(", part_num_var_mid, ", by = ", part_cat_var_binned, ", k = ", k_val_by, ", bs = \"", bs_numeric, "\")"))
+                   } else {
+                        warning(paste("Categorical column", part_cat_var_binned, "not found for 'by' term in participant smooth."))
+                   }
+                   if (cnt_cat_var_binned %in% names(gam_data_for_fitting)) {
+                       formula_terms <- c(formula_terms,
+                                         paste0("s(", cnt_num_var_mid, ", by = ", cnt_cat_var_binned, ", k = ", k_val_by, ", bs = \"", bs_numeric, "\")"))
+                   } else {
+                        warning(paste("Categorical column", cnt_cat_var_binned, "not found for 'by' term in contact smooth."))
+                   }
+                } # End for cat_suffix loop
+            } else {
+                # No categorical variables, just add simple smooths
+                formula_terms <- c(formula_terms,
+                                  paste0("s(", part_num_var_mid, ", k = ", k_tensor[1], ", bs = \"", bs_numeric, "\")"))
+                formula_terms <- c(formula_terms,
+                                  paste0("s(", cnt_num_var_mid, ", k = ", k_tensor[2], ", bs = \"", bs_numeric, "\")"))
+            }
+        }
+    }
+
+    # Assemble final formula string including the offset
     if (length(formula_terms) == 0) {
-        stop("Could not generate any terms for the GAM formula based on dimensions.")
+        # If only offset, GAM might complain. Need at least one predictor or intercept.
+        # Add intercept if no terms? Or rely on mgcv default? Let's add explicitly.
+        # formula_str <- "N ~ 1 + offset(log(N_participants))"
+        stop("Could not generate any smoother/interaction terms for the GAM formula based on dimensions.")
+    } else {
+        formula_str <- paste("N ~", paste(formula_terms, collapse = " + "), "+ offset(log(N_participants))")
     }
-    formula_str <- paste("N ~", paste(formula_terms, collapse = " + "))
+
     gam_formula_generated <- as.formula(formula_str)
     message("Generated GAM formula: ", formula_str)
     formula_to_use <- gam_formula_generated
@@ -1225,17 +1396,58 @@ gam_contact_matrix <- function(survey,
      if (!inherits(gam_formula, "formula")) {
         stop("`gam_formula` must be a formula object or NULL.")
      }
-     message("Using provided GAM formula.")
+     message("Using provided GAM formula. Ensure it includes '+ offset(log(N_participants))' for correct rate modeling.")
+     # We need to add the midpoint columns to the data even if formula is provided
+     # (assuming the provided formula might use them)
+      midpoint_cols <- c()
+      numeric_suffixes_g <- dim_suffixes[sapply(dimensions, function(d) dim_types[[d]] == "numeric")]
+      for (num_suffix in numeric_suffixes_g) {
+            for (prefix in c("part_", "cnt_")) {
+                dim_name <- paste0(prefix, num_suffix)
+                binned_col <- paste0(dim_name, "_binned")
+                midpoint_col <- paste0(dim_name, "_midpoint")
+                midpoint_cols <- c(midpoint_cols, midpoint_col)
+                if (!midpoint_col %in% names(gam_data_for_fitting)) { # Check if already created
+                    breaks <- dim_breaks[[dim_name]]
+                    lower <- breaks[-length(breaks)]
+                    upper <- breaks[-1]
+                    midpoints <- lower + diff(breaks) / 2
+                    levels_original <- all_levels[[binned_col]]
+                    if (length(levels_original) != length(midpoints)) stop(paste("Mismatch levels/midpoints for", binned_col))
+                    level_to_midpoint_map <- setNames(midpoints, levels_original)
+                    gam_data_for_fitting[, (midpoint_col) := level_to_midpoint_map[as.character(get(binned_col))]]
+                }
+            }
+      }
      formula_to_use <- gam_formula
-     gam_formula_generated <- NA
+     gam_formula_generated <- NA # Mark as user-provided
   }
 
+
   # --- 3. Fit GAM/BAM ---
+  # Ensure data is data.frame for mgcv (though it often handles data.table)
+  gam_data_for_fitting_df <- as.data.frame(gam_data_for_fitting)
+
+  # --- Define potential 'by' variables --- 
+  formula_vars <- all.vars(formula_to_use) # Get all variables used in the formula
+  potential_by_vars <- formula_vars[grepl("_binned$", formula_vars)] # Find _binned vars in formula
+
+  # --- Ensure 'by' variables are factors --- 
+  for(by_var in potential_by_vars) {
+      if (by_var %in% names(gam_data_for_fitting_df)) {
+          if (!is.factor(gam_data_for_fitting_df[[by_var]])) {
+              message(paste("Converting potential 'by' variable", by_var, "to factor."))
+              gam_data_for_fitting_df[[by_var]] <- as.factor(gam_data_for_fitting_df[[by_var]])
+          }
+      } # No need to warn if not found, formula creation should handle that
+  }
+  # --- End Factor Conversion --- 
+
   if (use_bam) {
       message("Fitting model using bam()...")
       gam_fit <- mgcv::bam(
           formula = formula_to_use,
-          data = gam_data_agg,
+          data = gam_data_for_fitting_df,
           family = family,
           method = "fREML",
           discrete = TRUE,
@@ -1247,91 +1459,195 @@ gam_contact_matrix <- function(survey,
       message("Fitting model using gam()...")
       gam_fit <- mgcv::gam(
           formula = formula_to_use,
-          data = gam_data_agg,
+          data = gam_data_for_fitting_df,
           family = family,
           method = "fREML", # Use fREML for consistency
-          # gam does not use discrete or trace
           ...
       )
       message("GAM fitting complete.")
   }
 
-  # --- 4. Create Prediction Grid --- 
+  # --- 4. Create Prediction Grid ---
+  # Needs to represent the *centers* of the bins for numeric dimensions
+  # Needs factor levels for categorical dimensions
   prediction_grid_list <- lapply(dimensions, function(dim_name) {
-    breaks <- dim_breaks[[dim_name]]
-    if (is.numeric(breaks)) {
-      # Create midpoints from breaks for prediction
-      if(length(breaks) < 2) stop(paste("Numeric dimension", dim_name, "needs at least 2 breaks."))
-      return(breaks[-length(breaks)] + diff(breaks) / 2)
-    } else {
-      # Use levels directly for factors/characters
-       # Ensure levels used for prediction match factor levels in fitted data
-       if (is.factor(gam_data_agg[[dim_name]])) {
-           data_levels <- levels(gam_data_agg[[dim_name]])
-            provided_levels <- as.character(breaks)
-            if (!all(provided_levels %in% data_levels)) {
-                 warning(paste("Some levels provided in dim_breaks for", dim_name,
-                              "are not present in the modeling data factors:",
-                               paste(setdiff(provided_levels, data_levels), collapse=", ")))
-            }
-             # Return factor with levels matching data, subsetted by provided breaks
-             return(factor(provided_levels, levels=data_levels))
-
-       } else {
-            return(breaks) # Assume character otherwise
+      breaks <- dim_breaks[[dim_name]]
+      if (is.numeric(breaks)) {
+          # Use midpoints
+           if(length(breaks) < 2) stop(paste("Numeric dimension", dim_name, "needs at least 2 breaks."))
+           return(breaks[-length(breaks)] + diff(breaks) / 2)
+      } else {
+          # Use levels directly
+          levels_provided <- as.character(breaks)
+          # Ensure factor levels match those potentially used in the model (via interactions)
+          # Find corresponding binned column name
+           binned_col_name_pred <- names(all_levels)[endsWith(names(all_levels), paste0(dim_name, "_binned"))]
+           if (length(binned_col_name_pred) == 1) {
+               model_levels <- all_levels[[binned_col_name_pred]] # Use levels derived earlier
+               # Check consistency
+                if (!all(levels_provided %in% model_levels)) {
+                    warning(paste("Some prediction levels for", dim_name, "not in model factor levels:",
+                                  paste(setdiff(levels_provided, model_levels), collapse=", ")))
+                }
+                return(factor(levels_provided, levels=model_levels))
+           } else {
+                warning(paste("Could not find unique binned column for factor", dim_name, "using provided levels directly."))
+                return(factor(levels_provided))
+           }
        }
-    }
   })
-  names(prediction_grid_list) <- dimensions
+  # Name the list elements with the *midpoint* or *original factor* names expected by the formula
+  names(prediction_grid_list) <- sapply(dimensions, function(dim_name) {
+      if (dim_types[[dim_name]] == "numeric") paste0(dim_name, "_midpoint") else dim_name
+  })
 
-  # Ensure factor levels in prediction grid match those used in model fitting
-  prediction_grid <- do.call(expand.grid, c(prediction_grid_list, list(KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)))
 
-  # --- Create Explicit Interaction Factors in Prediction Grid --- # (Keep this step)
-  prediction_grid_dt <- as.data.table(prediction_grid)
-  for(sfx in categorical_suffixes) {
-      part_col <- paste0("part_", sfx)
-      cnt_col <- paste0("cnt_", sfx)
-      interaction_col <- paste0(sfx, "_interaction")
+  # Expand grid
+  prediction_grid <- expand.grid(prediction_grid_list, KEEP.OUT.ATTRS = FALSE)
+  prediction_grid$N_participants <- 1 # Set N_participants=1 for rate prediction
+  setDT(prediction_grid)
 
-      # Ensure base columns are factors with full levels matching dim_breaks
-      full_levels_part <- dim_breaks[[part_col]]
-      full_levels_cnt <- dim_breaks[[cnt_col]]
-      if (!is.factor(prediction_grid_dt[[part_col]]) || !identical(levels(prediction_grid_dt[[part_col]]), full_levels_part)){
-          prediction_grid_dt[, (part_col) := factor(get(part_col), levels = full_levels_part)]
+  # --- Add required 'by' factor columns to prediction grid --- 
+  # The fitted model formula now uses *_binned columns for 'by=' smooths.
+  # We need to add these to the prediction grid, ensuring levels match fitting data.
+  if (length(categorical_suffixes) > 0) {
+      formula_vars <- all.vars(formula_to_use) 
+      potential_by_vars <- formula_vars[grepl("_binned$", formula_vars)]
+      
+      for (cat_suffix in categorical_suffixes) {
+          part_cat_col_binned <- paste0("part_", cat_suffix, "_binned")
+          cnt_cat_col_binned <- paste0("cnt_", cat_suffix, "_binned")
+          part_cat_col_orig <- paste0("part_", cat_suffix)
+          cnt_cat_col_orig <- paste0("cnt_", cat_suffix)
+          
+          # Add participant factor if used in formula
+          if (part_cat_col_binned %in% potential_by_vars) {
+              if (part_cat_col_orig %in% names(prediction_grid)) {
+                  if (part_cat_col_binned %in% names(gam_data_for_fitting_df)) {
+                     fit_levels <- levels(gam_data_for_fitting_df[[part_cat_col_binned]])
+                     # Use data.table syntax to add column
+                     prediction_grid[, (part_cat_col_binned) := factor(.SD[[part_cat_col_orig]], levels = fit_levels)]
+                     message(paste("Added factor column:", part_cat_col_binned, "to prediction grid."))
+                  } else {
+                     warning(paste("Column", part_cat_col_binned, "used in formula but not found in fitting data frame! Cannot set levels for prediction grid."))
+                  }
+              } else {
+                  warning(paste("Original column", part_cat_col_orig, "not found in prediction grid to create", part_cat_col_binned))
+              }
+          }
+          # Add contact factor if used in formula
+          if (cnt_cat_col_binned %in% potential_by_vars) {
+              if (cnt_cat_col_orig %in% names(prediction_grid)) {
+                 if (cnt_cat_col_binned %in% names(gam_data_for_fitting_df)) {
+                     fit_levels <- levels(gam_data_for_fitting_df[[cnt_cat_col_binned]])
+                     # Use data.table syntax to add column
+                     prediction_grid[, (cnt_cat_col_binned) := factor(.SD[[cnt_cat_col_orig]], levels = fit_levels)]
+                     message(paste("Added factor column:", cnt_cat_col_binned, "to prediction grid."))
+                 } else {
+                      warning(paste("Column", cnt_cat_col_binned, "used in formula but not found in fitting data frame! Cannot set levels for prediction grid."))
+                 }
+              } else {
+                  warning(paste("Original column", cnt_cat_col_orig, "not found in prediction grid to create", cnt_cat_col_binned))
+              }
+          }
       }
-       if (!is.factor(prediction_grid_dt[[cnt_col]]) || !identical(levels(prediction_grid_dt[[cnt_col]]), full_levels_cnt)){
-          prediction_grid_dt[, (cnt_col) := factor(get(cnt_col), levels = full_levels_cnt)]
-      }
-
-      # Create the interaction factor using the same logic (drop=FALSE)
-      prediction_grid_dt[, (interaction_col) := interaction(get(part_col), get(cnt_col), drop = FALSE)]
   }
-  prediction_grid <- as.data.frame(prediction_grid_dt) # Convert back if needed by predict
-  # -------------------------------------------------------------
+  # --- End adding 'by' columns ---
 
-  # --- 5. Predict using GAM/BAM --- 
+  # --- Create Explicit Interaction Factors in Prediction Grid --- 
+  # This needs to be done AFTER adding the 'by' columns if they share base names
+  # Ensure levels match those potentially created during fitting
+  if (length(categorical_suffixes) > 0) {
+      for(sfx in categorical_suffixes) {
+          part_col_orig <- paste0("part_", sfx)
+          cnt_col_orig <- paste0("cnt_", sfx)
+          interaction_col <- paste0(sfx, "_interaction") 
+          
+          # Ensure base columns exist and are factors (may already be factors)
+          if (part_col_orig %in% names(prediction_grid) && !is.factor(prediction_grid[[part_col_orig]])) {
+               prediction_grid[, (part_col_orig) := as.factor(get(part_col_orig))]
+          }
+          if (cnt_col_orig %in% names(prediction_grid) && !is.factor(prediction_grid[[cnt_col_orig]])) {
+              prediction_grid[, (cnt_col_orig) := as.factor(get(cnt_col_orig))]
+          }
+          
+          # Create the interaction factor, ensuring all levels from the fitting data interaction are present
+          if (part_col_orig %in% names(prediction_grid) && cnt_col_orig %in% names(prediction_grid)) {
+              if (interaction_col %in% names(gam_data_for_fitting_df)) { # Check if it exists in fitting data
+                  fit_interaction_levels <- levels(gam_data_for_fitting_df[[interaction_col]])
+                  
+                  # Create interaction in prediction grid
+                  prediction_grid[, temp_interaction := interaction(get(part_col_orig), get(cnt_col_orig), drop = FALSE, sep = ":")]
+                  
+                  # Ensure factor levels match the fitting interaction levels
+                  current_levels <- levels(prediction_grid$temp_interaction)
+                  all_expected_levels <- union(current_levels, fit_interaction_levels)
+                  prediction_grid[, (interaction_col) := factor(temp_interaction, levels = all_expected_levels)]
+                  prediction_grid[, temp_interaction := NULL] # Remove temporary column
+                  
+                  message(paste("Added interaction factor column:", interaction_col, "to prediction grid."))
+              } else {
+                  warning(paste("Interaction column", interaction_col, "not found in fitting data. Cannot guarantee matching levels for prediction."))
+                  # Create interaction anyway, but levels might mismatch
+                  prediction_grid[, (interaction_col) := interaction(get(part_col_orig), get(cnt_col_orig), drop = FALSE, sep = ":")]
+              }
+           } else {
+                warning("Could not create interaction factor '", interaction_col, "' in prediction grid: base columns missing.")
+           }
+       }
+   }
+  # --- End Creating Interaction Factors ---
+
+  # Convert final prediction grid to data frame for return value consistency
+  prediction_grid_df <- as.data.frame(prediction_grid)
+
+  # --- 5. Predict on Grid --- 
+  # Initialize predicted_values to NULL
+  predicted_values <- NULL
+  predict_error <- NULL
+
   message("Predicting contact rates on grid...")
-  predicted_values <- tryCatch({
-      # Use the correct prediction function based on the fitted object class
+  tryCatch({
       predict_func <- if (inherits(gam_fit, "bam")) mgcv::predict.bam else mgcv::predict.gam
-      predict_func(
+      # Debugging: Print newdata just before predict
+      message("First few rows of newdata for prediction:")
+      print(head(prediction_grid))
+      message("Names of newdata for prediction:")
+      print(names(prediction_grid))
+
+      predicted_values <- predict_func(
           gam_fit,
           newdata = prediction_grid,
           type = "response",
           se.fit = FALSE
       )
+      message("Prediction function call completed.")
   }, error = function(e) {
-     # Error handling remains
-     stop(paste("Error during prediction:", e$message), call. = FALSE)
+     # Error handling
+     message("!!! Error occurred during prediction function call !!!")
+     predict_error <<- e # Store error message globally within the function scope
+     message(e$message)
   })
 
-  message("Prediction complete.")
+  # --- Check if prediction failed ---
+  if (is.null(predicted_values)) {
+      error_msg <- "Prediction step failed."
+      if (!is.null(predict_error)) {
+          error_msg <- paste(error_msg, "Reason:", predict_error$message)
+      }
+      stop(error_msg, call. = FALSE)
+  } else {
+      message(paste("Prediction successful. Length of predicted_values:", length(predicted_values)))
+  }
+
+  # Check for negative predictions
+  if (any(predicted_values < 0)) {
+      warning("Negative predicted values detected. This is not expected for Poisson or Negative Binomial models. Please check your model and data.")
+  }
 
   # --- 6. Reshape into Matrix/Array ---
-  # Determine the dimensions of the output array based on the number of levels/bins
-   # For factors, use the length of the provided breaks/levels
-   array_dims <- sapply(names(prediction_grid_list), function(dim_name) {
+   # Dimensions based on the number of levels/bins defined in *dim_breaks*
+   array_dims <- sapply(dimensions, function(dim_name) {
        breaks <- dim_breaks[[dim_name]]
        if (is.numeric(breaks)) {
            return(length(breaks) - 1) # Number of intervals
@@ -1339,47 +1655,50 @@ gam_contact_matrix <- function(survey,
            return(length(breaks)) # Number of levels
        }
    })
-  names(array_dims) <- dimensions # Keep dimension names
+  names(array_dims) <- dimensions # Keep original dimension names
 
-  # Create dimnames for the array
+  # Create dimnames for the array using the *binned factor levels* from all_levels
   array_dimnames <- lapply(dimensions, function(dim_name) {
-      breaks <- dim_breaks[[dim_name]]
-      if (is.numeric(breaks)) {
-          # Use interval notation like contact_matrix
-           lower <- breaks[-length(breaks)]
-           upper <- breaks[-1]
-           # Format nicely
-           format_interval <- function(l, u) {
-               paste0("[", format(l, trim=TRUE), ",", format(u, trim=TRUE), ")")
+       binned_col_name <- paste0(dim_name, "_binned")
+       if (binned_col_name %in% names(all_levels)) {
+           return(all_levels[[binned_col_name]])
+       } else {
+           # Fallback if something went wrong (shouldn't happen)
+           warning(paste("Could not find binned levels for dimension", dim_name, "using raw breaks for dimnames."))
+           breaks <- dim_breaks[[dim_name]]
+           if (is.numeric(breaks)) {
+                lower <- breaks[-length(breaks)]
+                upper <- breaks[-1]
+                return(paste0("[", format(lower, trim=TRUE), ",", format(upper, trim=TRUE), ")"))
+           } else {
+               return(as.character(breaks))
            }
-           return(format_interval(lower, upper))
-      } else {
-          # Use factor levels directly
-           return(as.character(breaks))
        }
   })
   names(array_dimnames) <- dimensions
 
+
   # Reshape the predicted values into the array
-  # Ensure the order of prediction matches the order of the reshaped array
-  # expand.grid generates data varying the first variable fastest.
-  # The array() function fills by varying the first index fastest. So the order should match.
+  if(length(predicted_values) != prod(array_dims)) {
+      stop(paste("Internal Error: Number of predicted values (", length(predicted_values),
+                 ") does not match the expected array size (", prod(array_dims), "). Check prediction grid generation."))
+  }
   contact_array <- array(
       data = predicted_values,
       dim = array_dims,
       dimnames = array_dimnames
   )
 
-  # --- 7. Return Results --- # Restore original return value
+  # --- 7. Return Results ---
   return(
     list(
-      matrix = contact_array,
-      prediction_grid = prediction_grid,
+      matrix = contact_array, # This is now contact *rate*
+      prediction_grid = prediction_grid_df, # Grid used for prediction
       dimensions = dimensions,
       dim_breaks = dim_breaks,
-      gam_formula = gam_formula_generated,
+      gam_formula = gam_formula_generated, # The one automatically generated (or NA)
       gam_fit = gam_fit,
-      fitting_data = gam_data_agg
+      fitting_data = gam_data_for_fitting # Data used for fitting (aggregated)
     )
   )
 }

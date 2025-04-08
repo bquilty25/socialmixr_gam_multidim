@@ -95,8 +95,9 @@ analysis_age_limits <- c(0, 80) # e.g., 0 to 80 years
 
 # GAM settings (can be customized)
 gam_family_setting <- nb() # Negative Binomial often suitable
-k_tensor_setting <- c(8, 8)
-k_by_setting <- 6 # Restore default (won't be used by auto-formula now)
+k_tensor_setting <- c(16, 16)
+# Define category-specific k values for 'by' smooths
+k_by_setting <- 10 # Default k for all 'by=' smooths
 bs_numeric_setting <- "ps"
 
 # --- Analysis 1: Age x Ethnicity ---
@@ -133,7 +134,7 @@ gam_results_age_eth <- tryCatch({
     family = gam_family_setting,
     age_limits = analysis_age_limits,
     k_tensor = k_tensor_setting,
-    # k_by = k_by_setting, # Not used by simplified auto-formula
+    k_by_default = k_by_setting, # Use default k for by= smooths
     bs_numeric = bs_numeric_setting,
     use_bam = TRUE # Explicitly use bam for ethnicity
   )
@@ -163,9 +164,9 @@ if (!is.null(gam_results_age_eth)) {
   message("-> Age labels generated.")
 
   # Factorise age groups for plotting
-  # Note: This assumes regular 5-year bands based on seq(..., 5)
-  plot_data_age_eth[, part_age_group := factor(paste0("[", findInterval(part_age, dim_breaks_age_eth$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dim_breaks_age_eth$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
-  plot_data_age_eth[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dim_breaks_age_eth$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dim_breaks_age_eth$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+  # Use midpoint columns for findInterval
+  plot_data_age_eth[, part_age_group := factor(paste0("[", dim_breaks_age_eth$part_age[findInterval(part_age_midpoint, dim_breaks_age_eth$part_age)], ",", dim_breaks_age_eth$part_age[findInterval(part_age_midpoint, dim_breaks_age_eth$part_age) + 1], ")"), levels = age_labels_part)]
+  plot_data_age_eth[, cnt_age_group := factor(paste0("[", dim_breaks_age_eth$cnt_age[findInterval(cnt_age_midpoint, dim_breaks_age_eth$cnt_age)], ",", dim_breaks_age_eth$cnt_age[findInterval(cnt_age_midpoint, dim_breaks_age_eth$cnt_age) + 1], ")"), levels = age_labels_cnt)]
   message("-> Age groups factorised.")
 
   # --- Visualization (Example: Facet wrap by ethnicity pair) --- 
@@ -178,13 +179,15 @@ if (!is.null(gam_results_age_eth)) {
   message("-> Creating p_age_eth plot object...")
   p_age_eth <- ggplot(plot_data_age_eth, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts", 
-                         na.value = "grey80", trans = scales::log10_trans()) + # Use log10 trans
+    scale_fill_viridis_c(option = "viridis", 
+                        name = "Predicted Contacts\n(log10 scale)",
+                        trans = "log10", 
+                        na.value = "grey80") + # Log scale & Viridis
     facet_grid(cnt_ethnicity ~ part_ethnicity, labeller = labeller(.default = label_both, .multi_line = TRUE)) +
     labs(
       title = "Predicted Contacts: Age x Ethnicity",
       subtitle = paste(ifelse(!is.null(target_country), paste("Country:", target_country), "All Countries"),
-                     "| Model: BAM (Age-Age Tensor + Eth Interaction)"), # Simplified model name
+                     "| Model: BAM (Age Tensor + Eth Interact, k_by=", k_by_setting, ")"), # Updated subtitle
       x = "Participant Age Group",
       y = "Contact Age Group"
     ) +
@@ -195,7 +198,8 @@ if (!is.null(gam_results_age_eth)) {
       legend.position = "right",
       plot.title = element_text(size = 14, face = "bold"),
       plot.subtitle = element_text(size = 10),
-      strip.text = element_text(size = 8, face = "bold")
+      strip.text = element_text(size = 8, face = "bold"),
+      legend.title = element_text(size = 8)
     )
   message("-> p_age_eth plot object created.")
 
@@ -205,7 +209,7 @@ if (!is.null(gam_results_age_eth)) {
   
   message("-> Preparing data for flattened_matrix...")
   plot_data_age_eth_flat <- copy(plot_data_age_eth)
-  plot_data_age_eth_flat <- arrange(plot_data_age_eth_flat, part_age, cnt_age)
+  plot_data_age_eth_flat <- arrange(plot_data_age_eth_flat, part_age_midpoint, cnt_age_midpoint)
   # Ensure factor levels are ordered correctly for faceting
   plot_data_age_eth_flat$part_age_group <- factor(plot_data_age_eth_flat$part_age_group, levels = age_labels_part) 
   plot_data_age_eth_flat$cnt_age_group <- factor(plot_data_age_eth_flat$cnt_age_group, levels = age_labels_cnt)
@@ -216,11 +220,11 @@ if (!is.null(gam_results_age_eth)) {
   p_age_eth_flattened <- ggplot(plot_data_age_eth_flat, # Rename plot object
                              aes(x = part_ethnicity, y = cnt_ethnicity, fill = predicted_contacts)) + 
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Mean contacts", 
-                         na.value="grey80", trans = scales::log10_trans()) + # Use log10 trans
+    scale_fill_viridis_c(option = "viridis", name = "Mean contacts\\n(log10 scale)",
+                         trans = "log10", na.value="grey80") + # Log scale & Viridis
     labs(
       title = sprintf("Mean Contacts: Age Group x Ethnicity"),
-      subtitle = paste("Model: BAM (Tensor Spline + Ethnicity Interaction)"),
+      subtitle = paste("Model: BAM (Tensor Spline + Eth Interact, k_by=", k_by_setting, ")"), # Updated subtitle
       x = "Participant Ethnicity",
       y = "Contact Ethnicity"
     ) +
@@ -259,68 +263,6 @@ if (!is.null(gam_results_age_eth)) {
   saveRDS(gam_results_age_eth, file = rds_filename_age_eth) # Restore saving
   message(paste("-> Age x Ethnicity GAM results object saved to:", rds_filename_age_eth))
 
-  # if (interactive()) print(p_age_eth) # Keep commented out for non-interactive run
-
-  #   # --- Compare Models (Age x Ethnicity) --- #
-  message("\nComparing GAM models for Age x Ethnicity...")
-  # Fit a simpler model without the ethnicity interaction for comparison
-  # Note: Requires gam_formula = NULL in gam_contact_matrix to be modified or
-  # a separate function call that omits the interaction term build logic.
-  # FOR NOW: We assume gam_contact_matrix needs to be called again with
-  # appropriate dimensions/formula if we want a true comparison.
-  # Simplified approach: Manually define a simpler formula
-  # (This requires gam_results_age_eth to contain the fitted model `gam_fit`)
-
-  # Example: Fit model without the explicit ethnicity interaction term
-  # Get the formula used for the main model (assuming it's stored)
-  main_formula_eth_str <- deparse(gam_results_age_eth$gam_formula)
-  # Attempt to create a simpler formula string (may need refinement)
-  simple_formula_eth_str <- gsub("\\s*\\+\\s*ethnicity_interaction", "", main_formula_eth_str)
-
-  if (simple_formula_eth_str != main_formula_eth_str) {
-    simple_formula_eth <- as.formula(simple_formula_eth_str)
-    message("Fitting simpler Age x Ethnicity model with formula: ", simple_formula_eth_str)
-
-    gam_results_simple_eth <- tryCatch({
-      # Re-run using the simpler formula - ensure data prep is implicitly handled
-      # or pass the aggregated data if gam_contact_matrix doesn't expose it
-      # This assumes gam_contact_matrix can accept a formula override
-      # or we fit directly using bam() on prepared data.
-      # Let's try fitting directly for simplicity here:
-      simpler_model_eth <- mgcv::bam(
-          formula = simple_formula_eth,
-          data = gam_results_age_eth$fitting_data, # Use fitting data returned by function
-          family = gam_family_setting,
-          method = "fREML",
-          discrete = TRUE
-          # Add other relevant bam args if needed
-      )
-      message("Simpler model fitted.")
-      list(gam_fit = simpler_model_eth) # Mimic structure
-    }, error = function(e) {
-       message("Error fitting simpler Age x Ethnicity model: ", e$message)
-       return(NULL)
-    })
-
-    if (!is.null(gam_results_simple_eth)) {
-      # Compare AIC
-      aic_full_eth <- AIC(gam_results_age_eth$gam_fit)
-      aic_simple_eth <- AIC(gam_results_simple_eth$gam_fit)
-      message(paste("AIC (Full Age x Eth Model):", round(aic_full_eth, 2)))
-      message(paste("AIC (Simple Age x Eth Model):", round(aic_simple_eth, 2)))
-      if (aic_full_eth < aic_simple_eth) {
-        message("Full model (with ethnicity interaction) has lower AIC.")
-      } else {
-        message("Simpler model (without ethnicity interaction) has lower AIC.")
-      }
-    } else {
-       message("Could not fit simpler model for Age x Ethnicity, skipping AIC comparison.")
-    }
-  } else {
-      message("Could not derive simpler formula for Age x Ethnicity, skipping comparison.")
-  }
-  # --- End Comparison --- #
-
 } else {
   message("\nAge x Ethnicity GAM analysis failed. No results to process or compare.")
 }
@@ -351,7 +293,7 @@ gam_results_age_ses <- tryCatch({
     family = gam_family_setting,
     age_limits = analysis_age_limits,
     k_tensor = k_tensor_setting,
-    # k_by = k_by_setting, # Not used by simplified auto-formula
+    k_by_default = k_by_setting, # Use default k for by= smooths
     bs_numeric = bs_numeric_setting,
     use_bam = TRUE # Use bam for SES now
   )
@@ -378,8 +320,9 @@ if (!is.null(gam_results_age_ses)) {
   # Generate age labels (reusing from above if breaks are the same)
   message("-> SES Age labels reused.")
   # Factorise age groups for plotting (reusing from above if breaks are the same)
-  plot_data_age_ses[, part_age_group := factor(paste0("[", findInterval(part_age, dim_breaks_age_ses$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dim_breaks_age_ses$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
-  plot_data_age_ses[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dim_breaks_age_ses$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dim_breaks_age_ses$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+  # Use midpoint columns for findInterval
+  plot_data_age_ses[, part_age_group := factor(paste0("[", dim_breaks_age_ses$part_age[findInterval(part_age_midpoint, dim_breaks_age_ses$part_age)], ",", dim_breaks_age_ses$part_age[findInterval(part_age_midpoint, dim_breaks_age_ses$part_age) + 1], ")"), levels = age_labels_part)]
+  plot_data_age_ses[, cnt_age_group := factor(paste0("[", dim_breaks_age_ses$cnt_age[findInterval(cnt_age_midpoint, dim_breaks_age_ses$cnt_age)], ",", dim_breaks_age_ses$cnt_age[findInterval(cnt_age_midpoint, dim_breaks_age_ses$cnt_age) + 1], ")"), levels = age_labels_cnt)]
   message("-> SES Age groups factorised.")
 
   # --- Visualization (Example: Facet wrap by SES pair) ---
@@ -392,13 +335,15 @@ if (!is.null(gam_results_age_ses)) {
   message("-> Creating p_age_ses plot object...")
   p_age_ses <- ggplot(plot_data_age_ses, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts", 
-                         na.value = "grey80", trans = scales::log10_trans()) + # Use log10 trans
+    scale_fill_viridis_c(option = "viridis", 
+                        name = "Predicted Contacts\n(log10 scale)",
+                        trans = "log10", 
+                        na.value = "grey80") + # Log scale & Viridis
     facet_grid(cnt_ses ~ part_ses, labeller = labeller(.default = label_both, .multi_line = TRUE)) +
     labs(
       title = "Predicted Contacts: Age x SES",
       subtitle = paste(ifelse(!is.null(target_country), paste("Country:", target_country), "All Countries"),
-                     "| Model: BAM (Age-Age Tensor + SES Interaction)"), # Updated model name
+                     "| Model: BAM (Age Tensor + SES Interact, k_by=", k_by_setting, ")"), # Updated subtitle
       x = "Participant Age Group",
       y = "Contact Age Group"
     ) +
@@ -420,6 +365,8 @@ if (!is.null(gam_results_age_ses)) {
   # --- Create and Save Flattened SES plot ---
   message("-> Preparing data for flattened SES matrix...")
   plot_data_age_ses_flat <- copy(plot_data_age_ses)
+  # Sort by midpoint columns
+  plot_data_age_ses_flat <- arrange(plot_data_age_ses_flat, part_age_midpoint, cnt_age_midpoint)
   # Ensure factor levels are ordered correctly for faceting
   plot_data_age_ses_flat$part_age_group <- factor(plot_data_age_ses_flat$part_age_group, levels = age_labels_part)
   plot_data_age_ses_flat$cnt_age_group <- factor(plot_data_age_ses_flat$cnt_age_group, levels = age_labels_cnt)
@@ -427,14 +374,14 @@ if (!is.null(gam_results_age_ses)) {
   plot_data_age_ses_flat$cnt_age_group <- factor(plot_data_age_ses_flat$cnt_age_group, levels = rev(age_labels_cnt))
 
   message("-> Creating p_age_ses_flattened plot object...")
-  p_age_ses_flattened <- ggplot(plot_data_age_ses_flat, 
-                                aes(x = part_ses, y = cnt_ses, fill = predicted_contacts)) + 
+  p_age_ses_flattened <- ggplot(plot_data_age_ses_flat,
+                                aes(x = part_ses, y = cnt_ses, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Mean contacts", 
-                         na.value="grey80", trans = scales::log10_trans()) + # Use log10 trans
+    scale_fill_viridis_c(option = "viridis", name = "Mean contacts\\n(log10 scale)",
+                         trans = "log10", na.value="grey80") + # Log scale & Viridis
     labs(
       title = sprintf("Mean Contacts: Age Group x SES"),
-      subtitle = paste("Model: BAM (Tensor Spline + SES Interaction)"),
+      subtitle = paste("Model: BAM (Tensor Spline + SES Interact, k_by=", k_by_setting, ")"), # Updated subtitle
       x = "Participant SES",
       y = "Contact SES"
     ) +
@@ -471,54 +418,43 @@ if (!is.null(gam_results_age_ses)) {
   saveRDS(gam_results_age_ses, file = rds_filename_age_ses)
   message(paste("-> Age x SES GAM results object saved to:", rds_filename_age_ses))
 
-  # if (interactive()) print(p_age_ses)
-
-  #   # --- Compare Models (Age x SES) --- #
-  message("\nComparing GAM models for Age x SES...")
-  # Similar logic as for Ethnicity
-  main_formula_ses_str <- deparse(gam_results_age_ses$gam_formula)
-  simple_formula_ses_str <- gsub("\\s*\\+\\s*ses_interaction", "", main_formula_ses_str)
-
-  if (simple_formula_ses_str != main_formula_ses_str) {
-      simple_formula_ses <- as.formula(simple_formula_ses_str)
-      message("Fitting simpler Age x SES model with formula: ", simple_formula_ses_str)
-
-      gam_results_simple_ses <- tryCatch({
-          simpler_model_ses <- mgcv::bam(
-              formula = simple_formula_ses,
-              data = gam_results_age_ses$fitting_data, # Use fitting data returned by function
-              family = gam_family_setting,
-              method = "fREML",
-              discrete = TRUE
-          )
-          message("Simpler model fitted.")
-          list(gam_fit = simpler_model_ses)
-      }, error = function(e) {
-          message("Error fitting simpler Age x SES model: ", e$message)
-          return(NULL)
-      })
-
-      if (!is.null(gam_results_simple_ses)) {
-          aic_full_ses <- AIC(gam_results_age_ses$gam_fit)
-          aic_simple_ses <- AIC(gam_results_simple_ses$gam_fit)
-          message(paste("AIC (Full Age x SES Model):", round(aic_full_ses, 2)))
-          message(paste("AIC (Simple Age x SES Model):", round(aic_simple_ses, 2)))
-          if (aic_full_ses < aic_simple_ses) {
-              message("Full model (with SES interaction) has lower AIC.")
-          } else {
-              message("Simpler model (without SES interaction) has lower AIC.")
-          }
-      } else {
-          message("Could not fit simpler model for Age x SES, skipping AIC comparison.")
-      }
-  } else {
-      message("Could not derive simpler formula for Age x SES, skipping comparison.")
-  }
-  # --- End Comparison --- #
-
 } else {
   message("\nAge x SES GAM analysis failed. No results to process or compare.")
 }
+
+# --- Prepare for Age x Gender Analysis: Filter out 'Other' Gender ---
+message("\n--- Preparing for Age x Gender: Filtering 'Other' gender ---")
+gender_filter_level <- "Other"
+
+# Filter participants
+initial_part_gender_filter_rows <- nrow(new_survey_data$participants)
+new_survey_data$participants <- new_survey_data$participants[part_gender != gender_filter_level]
+filtered_part_gender_filter_rows <- nrow(new_survey_data$participants)
+message(paste("-> Removed", initial_part_gender_filter_rows - filtered_part_gender_filter_rows, "participants with gender '", gender_filter_level, "'."))
+
+# Filter contacts
+initial_cnt_gender_filter_rows <- nrow(new_survey_data$contacts)
+new_survey_data$contacts <- new_survey_data$contacts[cnt_gender != gender_filter_level]
+filtered_cnt_gender_filter_rows <- nrow(new_survey_data$contacts)
+message(paste("-> Removed", initial_cnt_gender_filter_rows - filtered_cnt_gender_filter_rows, "contacts with gender '", gender_filter_level, "'."))
+
+# Ensure consistency AGAIN after gender filtering
+part_ids_remaining_gender <- unique(new_survey_data$participants$part_id)
+contacts_before_consistency_gender <- nrow(new_survey_data$contacts)
+new_survey_data$contacts <- new_survey_data$contacts[part_id %in% part_ids_remaining_gender]
+contacts_after_consistency_gender <- nrow(new_survey_data$contacts)
+if(contacts_after_consistency_gender < contacts_before_consistency_gender) {
+    message(paste("-> Removed", contacts_before_consistency_gender - contacts_after_consistency_gender, "contacts due to participant gender filtering."))
+}
+contact_ids_remaining_gender <- unique(new_survey_data$contacts$part_id)
+participants_before_consistency_gender <- nrow(new_survey_data$participants)
+new_survey_data$participants <- new_survey_data$participants[part_id %in% contact_ids_remaining_gender]
+participants_after_consistency_gender <- nrow(new_survey_data$participants)
+if(participants_after_consistency_gender < participants_before_consistency_gender) {
+    message(paste("-> Removed", participants_before_consistency_gender - participants_after_consistency_gender, "participants with no remaining contacts after gender filtering."))
+}
+message("Gender filtering complete.")
+# -------------------------------------------------------------------
 
 # --- Analysis 3: Age x Gender --- # ADDING NEW ANALYSIS
 message("\n--- Starting Analysis 3: Age x Gender ---")
@@ -552,6 +488,7 @@ gam_results_age_gender <- tryCatch({
     family = gam_family_setting,
     age_limits = analysis_age_limits,
     k_tensor = k_tensor_setting,
+    k_by_default = k_by_setting, # Use default k for by= smooths
     bs_numeric = bs_numeric_setting,
     use_bam = TRUE # Use bam for gender
   )
@@ -578,8 +515,9 @@ if (!is.null(gam_results_age_gender)) {
   # Generate age labels (reusing from above if breaks are the same)
   message("-> Gender Age labels reused.")
   # Factorise age groups for plotting (reusing from above if breaks are the same)
-  plot_data_age_gender[, part_age_group := factor(paste0("[", findInterval(part_age, dim_breaks_age_gender$part_age, left.open = TRUE) * 5 - 5, ",", findInterval(part_age, dim_breaks_age_gender$part_age, left.open = TRUE) * 5, ")"), levels = age_labels_part)]
-  plot_data_age_gender[, cnt_age_group := factor(paste0("[", findInterval(cnt_age, dim_breaks_age_gender$cnt_age, left.open = TRUE) * 5 - 5, ",", findInterval(cnt_age, dim_breaks_age_gender$cnt_age, left.open = TRUE) * 5, ")"), levels = age_labels_cnt)]
+  # Use midpoint columns for findInterval
+  plot_data_age_gender[, part_age_group := factor(paste0("[", dim_breaks_age_gender$part_age[findInterval(part_age_midpoint, dim_breaks_age_gender$part_age)], ",", dim_breaks_age_gender$part_age[findInterval(part_age_midpoint, dim_breaks_age_gender$part_age) + 1], ")"), levels = age_labels_part)]
+  plot_data_age_gender[, cnt_age_group := factor(paste0("[", dim_breaks_age_gender$cnt_age[findInterval(cnt_age_midpoint, dim_breaks_age_gender$cnt_age)], ",", dim_breaks_age_gender$cnt_age[findInterval(cnt_age_midpoint, dim_breaks_age_gender$cnt_age) + 1], ")"), levels = age_labels_cnt)]
   message("-> Gender Age groups factorised.")
 
   # --- Visualization (Example: Facet wrap by Gender pair) ---
@@ -593,13 +531,15 @@ if (!is.null(gam_results_age_gender)) {
   message("-> Creating p_age_gender plot object...")
   p_age_gender <- ggplot(plot_data_age_gender, aes(x = part_age_group, y = cnt_age_group, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Predicted\nContacts",
-                         na.value = "grey80", trans = scales::log10_trans()) + # Use log10 trans
+    scale_fill_viridis_c(option = "viridis", 
+                        name = "Predicted Contacts\n(log10 scale)",
+                        trans = "log10", 
+                        na.value = "grey80") + # Log scale & Viridis
     facet_grid(cnt_gender ~ part_gender, labeller = labeller(.default = label_both, .multi_line = TRUE)) +
     labs(
       title = "Predicted Contacts: Age x Gender",
       subtitle = paste(ifelse(!is.null(target_country), paste("Country:", target_country), "All Countries"),
-                     "| Model: BAM (Age-Age Tensor + Gender Interaction)"), # Updated model name
+                     "| Model: BAM (Age Tensor + Gender Interact, k_by=", k_by_setting, ")"), # Updated subtitle
       x = "Participant Age Group",
       y = "Contact Age Group"
     ) +
@@ -621,6 +561,8 @@ if (!is.null(gam_results_age_gender)) {
   # --- Create and Save Flattened Gender plot ---
   message("-> Preparing data for flattened Gender matrix...")
   plot_data_age_gender_flat <- copy(plot_data_age_gender)
+  # Sort by midpoint columns
+  plot_data_age_gender_flat <- arrange(plot_data_age_gender_flat, part_age_midpoint, cnt_age_midpoint)
   # Ensure factor levels are ordered correctly for faceting
   plot_data_age_gender_flat$part_age_group <- factor(plot_data_age_gender_flat$part_age_group, levels = age_labels_part)
   plot_data_age_gender_flat$cnt_age_group <- factor(plot_data_age_gender_flat$cnt_age_group, levels = age_labels_cnt)
@@ -631,11 +573,11 @@ if (!is.null(gam_results_age_gender)) {
   p_age_gender_flattened <- ggplot(plot_data_age_gender_flat,
                                 aes(x = part_gender, y = cnt_gender, fill = predicted_contacts)) +
     geom_tile(colour = "white", linewidth = 0.1) +
-    scale_fill_viridis_c(option = "plasma", name = "Mean contacts",
-                         na.value="grey80", trans = scales::log10_trans()) + # Use log10 trans
+    scale_fill_viridis_c(option = "viridis", name = "Mean contacts\\n(log10 scale)",
+                         trans = "log10", na.value="grey80") + # Log scale & Viridis
     labs(
       title = sprintf("Mean Contacts: Age Group x Gender"),
-      subtitle = paste("Model: BAM (Tensor Spline + Gender Interaction)"),
+      subtitle = paste("Model: BAM (Tensor Spline + Gender Interact, k_by=", k_by_setting, ")"), # Updated subtitle
       x = "Participant Gender",
       y = "Contact Gender"
     ) +
@@ -671,50 +613,6 @@ if (!is.null(gam_results_age_gender)) {
   message("-> Saving Gender RDS object...")
   saveRDS(gam_results_age_gender, file = rds_filename_age_gender)
   message(paste("-> Age x Gender GAM results object saved to:", rds_filename_age_gender))
-
-  # --- Compare Models (Age x Gender) --- #
-  message("\nComparing GAM models for Age x Gender...")
-  # Similar logic as for Ethnicity/SES
-  main_formula_gender_str <- deparse(gam_results_age_gender$gam_formula)
-  # Note: Assumes the interaction column is named 'gender_interaction'
-  simple_formula_gender_str <- gsub("\\s*\\+\\s*gender_interaction", "", main_formula_gender_str)
-
-  if (simple_formula_gender_str != main_formula_gender_str) {
-      simple_formula_gender <- as.formula(simple_formula_gender_str)
-      message("Fitting simpler Age x Gender model with formula: ", simple_formula_gender_str)
-
-      gam_results_simple_gender <- tryCatch({
-          simpler_model_gender <- mgcv::bam(
-              formula = simple_formula_gender,
-              data = gam_results_age_gender$fitting_data, # Use fitting data returned by function
-              family = gam_family_setting,
-              method = "fREML",
-              discrete = TRUE
-          )
-          message("Simpler model fitted.")
-          list(gam_fit = simpler_model_gender)
-      }, error = function(e) {
-          message("Error fitting simpler Age x Gender model: ", e$message)
-          return(NULL)
-      })
-
-      if (!is.null(gam_results_simple_gender)) {
-          aic_full_gender <- AIC(gam_results_age_gender$gam_fit)
-          aic_simple_gender <- AIC(gam_results_simple_gender$gam_fit)
-          message(paste("AIC (Full Age x Gender Model):", round(aic_full_gender, 2)))
-          message(paste("AIC (Simple Age x Gender Model):", round(aic_simple_gender, 2)))
-          if (aic_full_gender < aic_simple_gender) {
-              message("Full model (with Gender interaction) has lower AIC.")
-          } else {
-              message("Simpler model (without Gender interaction) has lower AIC.")
-          }
-      } else {
-          message("Could not fit simpler model for Age x Gender, skipping AIC comparison.")
-      }
-  } else {
-      message("Could not derive simpler formula for Age x Gender, skipping comparison.")
-  }
-  # --- End Comparison --- #
 
 } else {
   message("\nAge x Gender GAM analysis failed. No results to process or compare.")
